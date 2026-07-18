@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Phone Home Server</title>
+<style>
+ :root{color-scheme:dark}
+ body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+      font-family:system-ui,sans-serif;background:radial-gradient(circle at 50% 30%,#1d2b3a,#0b0f14);color:#e8eef5;text-align:center}
+ .card{padding:3rem 2.5rem;border:1px solid #2a3a4d;border-radius:20px;background:#121a24cc;box-shadow:0 20px 60px #0008;max-width:90vw}
+ h1{margin:.2em 0;font-size:2.4rem}
+ .dot{color:#3ddc84}
+ p{color:#9fb2c6;line-height:1.5}
+ code{background:#0b1118;padding:.15em .45em;border-radius:6px;color:#7fd7ff}
+</style></head>
+<body><div class="card">
+ <h1><span class="dot">&#9679;</span> It works!</h1>
+ <p>This page is served from an <b>old Android phone</b><br>running <b>Termux + nginx</b> as a home server.</p>
+ <p>Host: <code id="h"></code><br>Loaded: <code id="t"></code></p>
+ <p style="font-size:.85em;opacity:.6">Replace this file to deploy your own site &rarr; <code>scripts/deploy.sh</code></p>
+</div>
+<script>
+ document.getElementById('h').textContent=location.host;
+ document.getElementById('t').textContent=new Date().toLocaleString();
+</script>
+</body></html>
