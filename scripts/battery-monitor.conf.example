@@ -1,0 +1,12 @@
+# battery-monitor config — copy to ~/batt-monitor/monitor.conf on the phone.
+# The installer writes this for you; edit + restart the monitor to change anything.
+
+NAME=home-server                 # label used in notification titles
+NTFY_URL=https://ntfy.sh
+NTFY_TOPIC=                       # your random private topic (keep it secret-ish)
+HEALTHCHECK_URL=                  # healthchecks.io ping URL (empty = heartbeat off)
+
+TEMP_WARN=43                      # °C -> high-priority "warming" alert
+TEMP_URGENT=48                    # °C -> urgent "hot" alert (breaks through DND)
+POLL_SECS=300                     # sample interval (5 min)
+DIGEST_HOUR=9                     # local hour (0-23) for the daily report
