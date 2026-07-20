@@ -59,6 +59,20 @@ scripts/deploy.sh ./my-site           # replaces the served site with ./my-site/
 It tars the folder, serves it briefly from the Mac, and has Termux fetch+extract it —
 no storage permissions, no typing. Edit `www/index.html` for the default page.
 
+**Deploy over WiFi (no cable)** — once `scripts/setup-ssh.sh` has run (installs Termux
+`sshd`, key-based, auto-starts on boot, port 8022):
+```bash
+scripts/deploy-ssh.sh ./www                 # scp over WiFi + reload nginx, no ADB
+ssh -p 8022 <phone-ip> 'nginx -s reload'    # any command; Termux accepts any username
+```
+
+## Diagnostics page
+
+`www/diag.html` is a self-contained dashboard (temperature chart with 43/48°C threshold
+lines, battery-level chart, live stat tiles, 24h/3d/7d toggle, auto-refresh). The battery
+monitor writes `batt.json` into the docroot every 5 min, so the page just loads:
+**`http://<phone-ip>:8080/diag.html`**. No server-side code — nginx serves static files.
+
 ---
 
 ## Maintenance from the Mac
@@ -192,8 +206,13 @@ doesn't expose `charge_full`); it was ~94% (fcc 4073 / design 4310 mAh) when mea
 provision.sh              main orchestrator — run this on the Mac
 scripts/termux-setup.sh   runs inside Termux (fetched by provision.sh): site + boot + start
 scripts/termux-run.sh     run any command inside Termux from the Mac
-scripts/deploy.sh         deploy a local site folder to the phone
+scripts/deploy.sh         deploy a local site folder to the phone (over ADB)
+scripts/setup-ssh.sh      install Termux sshd (once) -> WiFi deploys, no more cable
+scripts/deploy-ssh.sh     deploy a site folder over WiFi (scp), no ADB
+scripts/setup-monitor.sh  install the battery monitor (Termux:API + ntfy + heartbeat)
+scripts/battery-monitor.sh  the monitor loop (alerts, digest, writes batt.json)
 scripts/lib.sh            shared ADB/Termux helpers (sourced by run + deploy)
 www/index.html            default page (edit or replace via deploy.sh)
+www/diag.html             battery/temperature diagnostics dashboard
 cache/                    downloaded Termux APKs (gitignored)
 ```
