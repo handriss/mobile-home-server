@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Phone Server — Diagnostics</title>
+<style>
+  :root{
+    --bg:#0e131a; --card:#151d27; --line:#233042; --ink:#e6edf3; --muted:#8b98a5;
+    --temp:#38bdf8; --level:#a78bfa; --warn:#f59e0b; --urgent:#ef4444; --ok:#22c55e;
+    --grid:rgba(255,255,255,.06);
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f5f7fa; --card:#ffffff; --line:#e2e8f0; --ink:#0f1a26; --muted:#5a6b7b;
+           --temp:#0284c7; --level:#7c3aed; --grid:rgba(0,0,0,.06); }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:840px;margin:0 auto;padding:20px 16px 48px}
+  header{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:18px}
+  h1{font-size:1.05rem;margin:0;font-weight:600}
+  .sub{color:var(--muted);font-size:.82rem}
+  .stale{color:var(--urgent);font-weight:600}
+  .hero{display:flex;align-items:center;gap:18px;flex-wrap:wrap;margin-bottom:16px}
+  .bigtemp{font-size:3rem;font-weight:650;line-height:1;font-variant-numeric:tabular-nums}
+  .bigtemp small{font-size:1.1rem;color:var(--muted);font-weight:500}
+  .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:8px;flex:1;min-width:240px}
+  .tile{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:9px 11px}
+  .tile .k{color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.03em}
+  .tile .v{font-size:1.05rem;font-weight:600;font-variant-numeric:tabular-nums;margin-top:2px}
+  .ranges{display:flex;gap:6px;margin:6px 0 4px}
+  .ranges button{background:var(--card);border:1px solid var(--line);color:var(--muted);
+       border-radius:8px;padding:5px 12px;font-size:.82rem;cursor:pointer}
+  .ranges button.on{color:var(--ink);border-color:var(--temp);background:color-mix(in srgb,var(--temp) 12%,var(--card))}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 12px 8px;margin-top:12px;position:relative}
+  .card h2{margin:0 0 2px;font-size:.8rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.03em;
+       display:flex;justify-content:space-between}
+  .card h2 .stats{color:var(--ink);font-weight:500;text-transform:none;letter-spacing:0}
+  canvas{width:100%;display:block;touch-action:none}
+  .tip{position:absolute;pointer-events:none;background:var(--bg);border:1px solid var(--line);
+       border-radius:8px;padding:6px 9px;font-size:.78rem;opacity:0;transition:opacity .08s;white-space:nowrap;
+       font-variant-numeric:tabular-nums;box-shadow:0 6px 20px #0006;z-index:5}
+  .legend{display:flex;gap:14px;font-size:.75rem;color:var(--muted);margin-top:4px;flex-wrap:wrap}
+  .legend i{display:inline-block;width:14px;height:0;border-top:2px solid;vertical-align:middle;margin-right:5px}
+  footer{color:var(--muted);font-size:.75rem;margin-top:20px;text-align:center}
+  a{color:var(--temp)}
+</style></head>
+<body><div class="wrap">
+  <header>
+    <h1 id="name">Phone Server — Diagnostics</h1>
+    <div class="sub" id="updated">loading…</div>
+  </header>
+
+  <div class="hero">
+    <div class="bigtemp" id="bigtemp">–<small>°C</small></div>
+    <div class="tiles">
+      <div class="tile"><div class="k">Battery</div><div class="v" id="t-level">–</div></div>
+      <div class="tile"><div class="k">Health</div><div class="v" id="t-health">–</div></div>
+      <div class="tile"><div class="k">Status</div><div class="v" id="t-status">–</div></div>
+      <div class="tile"><div class="k">Voltage</div><div class="v" id="t-volt">–</div></div>
+      <div class="tile"><div class="k">Monitor up</div><div class="v" id="t-up">–</div></div>
+    </div>
+  </div>
+
+  <div class="ranges" id="ranges">
+    <button data-h="24" class="on">24h</button>
+    <button data-h="72">3d</button>
+    <button data-h="168">7d</button>
+  </div>
+
+  <div class="card">
+    <h2>Battery temperature <span class="stats" id="tstats"></span></h2>
+    <canvas id="tempc" height="440"></canvas>
+    <div class="tip" id="temptip"></div>
+    <div class="legend">
+      <span><i style="border-color:var(--temp)"></i>temperature</span>
+      <span><i style="border-color:var(--warn);border-top-style:dashed"></i>warn (<span id="lw">43</span>°C)</span>
+      <span><i style="border-color:var(--urgent);border-top-style:dashed"></i>urgent (<span id="lu">48</span>°C)</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Battery level <span class="stats" id="lstats"></span></h2>
+    <canvas id="levelc" height="220"></canvas>
+    <div class="tip" id="leveltip"></div>
+  </div>
+
+  <footer>Auto-refreshes every 60s · data from <code>batt.json</code> (5-min samples) · <a href="/">home</a></footer>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+let DATA=null, RANGE_H=24;
+
+function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
+function fmtAgo(sec){ if(sec<90)return sec+'s ago'; if(sec<5400)return Math.round(sec/60)+'m ago';
+  if(sec<172800)return Math.round(sec/3600)+'h ago'; return Math.round(sec/86400)+'d ago'; }
+function hhmm(t){const d=new Date(t*1000);return d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0');}
+function dayLbl(t){const d=new Date(t*1000);return d.toLocaleDateString(undefined,{weekday:'short'})+' '+hhmm(t);}
+
+async function load(){
+  try{
+    const r=await fetch('batt.json?_='+Date.now(),{cache:'no-store'});
+    if(!r.ok) throw new Error(r.status);
+    DATA=await r.json();
+    render();
+    requestAnimationFrame(render);   // re-render next frame so canvas sizing is correct after layout
+  }catch(e){ $('updated').innerHTML='<span class="stale">no data yet — waiting for the monitor to write batt.json</span>'; }
+}
+
+function render(){
+  if(!DATA) return;
+  const now=DATA.now||{}, gen=DATA.generated, age=Math.max(0,Math.floor(Date.now()/1000-gen));
+  $('name').textContent=(DATA.name||'Phone Server')+' — Diagnostics';
+  const staleTxt = age>720 ? `<span class="stale">stale — last update ${fmtAgo(age)} (monitor may be down)</span>` : `updated ${fmtAgo(age)}`;
+  $('updated').innerHTML=staleTxt;
+  const warn=DATA.warn??43, urgent=DATA.urgent??48;
+  $('lw').textContent=warn; $('lu').textContent=urgent;
+
+  const bt=$('bigtemp'), tv=now.temp;
+  bt.innerHTML=(tv==null?'–':(+tv).toFixed(1))+'<small>°C</small>';
+  bt.style.color = tv==null?'var(--ink)' : tv>=urgent?'var(--urgent)' : tv>=warn?'var(--warn)' : 'var(--ok)';
+  $('t-level').textContent=(now.level??'–')+'%';
+  $('t-health').textContent=now.health||'–';
+  $('t-status').textContent=now.status||'–';
+  $('t-volt').textContent=now.voltage?(now.voltage/1000).toFixed(2)+' V':'–';
+  $('t-up').textContent=(now.uptime_h!=null)?(+now.uptime_h).toFixed(1)+' h':'–';
+
+  const cut=gen-RANGE_H*3600;
+  const pts=(DATA.series||[]).filter(p=>p[0]>=cut);
+  drawTemp(pts,warn,urgent);
+  drawLevel(pts);
+}
+
+// shared canvas setup with devicePixelRatio scaling
+function setup(cv){
+  const dpr=window.devicePixelRatio||1, w=cv.clientWidth, h=cv.getAttribute('height')|0;
+  cv.width=w*dpr; cv.height=h*dpr; const x=cv.getContext('2d'); x.setTransform(dpr,0,0,dpr,0,0);
+  x.clearRect(0,0,w,h); return {x,w,h};
+}
+const PAD={l:38,r:12,t:10,b:22};
+
+function niceScale(min,max){ if(min===max){min-=1;max+=1;} const pad=(max-min)*0.12; return [min-pad,max+pad]; }
+
+function drawTemp(pts,warn,urgent){
+  const cv=$('tempc'),{x,w,h}=setup(cv);
+  const ink=css('--ink'),muted=css('--muted'),grid=css('--grid'),tc=css('--temp'),cw=css('--warn'),cu=css('--urgent');
+  if(!pts.length){ x.fillStyle=muted;x.font='13px system-ui';x.fillText('no samples in this range',PAD.l,h/2);$('tstats').textContent='';return; }
+  const temps=pts.map(p=>p[1]);
+  let lo=Math.min(...temps,warn-1), hi=Math.max(...temps,urgent+1);[lo,hi]=niceScale(lo,hi);
+  const t0=pts[0][0],t1=pts[pts.length-1][0];
+  const X=t=>PAD.l+(t-t0)/Math.max(1,(t1-t0))*(w-PAD.l-PAD.r);
+  const Y=v=>PAD.t+(1-(v-lo)/(hi-lo))*(h-PAD.t-PAD.b);
+  // y grid + labels
+  x.font='11px system-ui';x.textBaseline='middle';
+  const ticks=5;
+  for(let i=0;i<=ticks;i++){const v=lo+(hi-lo)*i/ticks,yy=Y(v);
+    x.strokeStyle=grid;x.beginPath();x.moveTo(PAD.l,yy);x.lineTo(w-PAD.r,yy);x.stroke();
+    x.fillStyle=muted;x.textAlign='right';x.fillText(v.toFixed(0)+'°',PAD.l-6,yy);}
+  // x time labels
+  x.textAlign='center';x.textBaseline='alphabetic';
+  const span=t1-t0, showDay=span>2*86400;
+  for(let i=0;i<=4;i++){const t=t0+span*i/4,xx=X(t);
+    x.fillStyle=muted;x.fillText(showDay?new Date(t*1000).toLocaleDateString(undefined,{weekday:'short'}):hhmm(t),xx,h-6);}
+  // threshold lines
+  const dash=(v,c)=>{x.strokeStyle=c;x.setLineDash([5,4]);x.lineWidth=1.5;x.beginPath();x.moveTo(PAD.l,Y(v));x.lineTo(w-PAD.r,Y(v));x.stroke();x.setLineDash([]);};
+  if(urgent<hi&&urgent>lo)dash(urgent,cu); if(warn<hi&&warn>lo)dash(warn,cw);
+  // area + line
+  x.beginPath();pts.forEach((p,i)=>{const xx=X(p[0]),yy=Y(p[1]);i?x.lineTo(xx,yy):x.moveTo(xx,yy);});
+  const grad=x.createLinearGradient(0,PAD.t,0,h-PAD.b);grad.addColorStop(0,tc+'40');grad.addColorStop(1,tc+'00');
+  x.lineTo(X(t1),Y(lo));x.lineTo(X(t0),Y(lo));x.closePath();x.fillStyle=grad;x.fill();
+  x.beginPath();pts.forEach((p,i)=>{const xx=X(p[0]),yy=Y(p[1]);i?x.lineTo(xx,yy):x.moveTo(xx,yy);});
+  x.strokeStyle=tc;x.lineWidth=2;x.lineJoin='round';x.stroke();
+  const mn=Math.min(...temps),mx=Math.max(...temps),av=temps.reduce((a,b)=>a+b,0)/temps.length;
+  $('tstats').textContent=`max ${mx.toFixed(1)}° · avg ${av.toFixed(1)}° · min ${mn.toFixed(1)}°`;
+  cv._h={pts,X,Y,t0,t1,lo,hi,fmt:v=>v.toFixed(1)+'°C',tip:$('temptip'),unit:'temp'};
+}
+
+function drawLevel(pts){
+  const cv=$('levelc'),{x,w,h}=setup(cv);
+  const muted=css('--muted'),grid=css('--grid'),lc=css('--level');
+  if(!pts.length){$('lstats').textContent='';return;}
+  const lvls=pts.map(p=>p[2]);let lo=Math.max(0,Math.min(...lvls)-5),hi=Math.min(100,Math.max(...lvls)+5);if(lo===hi){lo=Math.max(0,lo-5);hi=Math.min(100,hi+5);}
+  const t0=pts[0][0],t1=pts[pts.length-1][0];
+  const X=t=>PAD.l+(t-t0)/Math.max(1,(t1-t0))*(w-PAD.l-PAD.r);
+  const Y=v=>PAD.t+(1-(v-lo)/(hi-lo))*(h-PAD.t-PAD.b);
+  x.font='11px system-ui';x.textBaseline='middle';x.textAlign='right';
+  for(let i=0;i<=3;i++){const v=lo+(hi-lo)*i/3,yy=Y(v);x.strokeStyle=grid;x.beginPath();x.moveTo(PAD.l,yy);x.lineTo(w-PAD.r,yy);x.stroke();x.fillStyle=muted;x.fillText(v.toFixed(0)+'%',PAD.l-6,yy);}
+  x.beginPath();pts.forEach((p,i)=>{const xx=X(p[0]),yy=Y(p[2]);i?x.lineTo(xx,yy):x.moveTo(xx,yy);});
+  x.strokeStyle=lc;x.lineWidth=2;x.lineJoin='round';x.stroke();
+  $('lstats').textContent=`${Math.min(...lvls)}–${Math.max(...lvls)}%`;
+  cv._h={pts,X,Y,t0,t1,lo,hi,fmt:v=>v+'%',tip:$('leveltip'),unit:'level',idx:2};
+}
+
+// hover crosshair + tooltip
+function hover(cv){
+  cv.addEventListener('pointermove',e=>{
+    const H=cv._h;if(!H)return;const r=cv.getBoundingClientRect();const mx=e.clientX-r.left;
+    // nearest point
+    let best=null,bd=1e9;for(const p of H.pts){const d=Math.abs(H.X(p[0])-mx);if(d<bd){bd=d;best=p;}}
+    if(!best){H.tip.style.opacity=0;return;}
+    render_over(cv);
+    const val=H.unit==='level'?best[2]:best[1];const px=H.X(best[0]),py=H.Y(val);
+    const x=cv.getContext('2d');x.strokeStyle=css('--muted');x.globalAlpha=.4;x.setLineDash([3,3]);
+    x.beginPath();x.moveTo(px,PAD.t);x.lineTo(px,cv.clientHeight-PAD.b);x.stroke();x.setLineDash([]);x.globalAlpha=1;
+    x.fillStyle=H.unit==='level'?css('--level'):css('--temp');x.beginPath();x.arc(px,py,3.5,0,7);x.fill();
+    H.tip.style.opacity=1;H.tip.innerHTML=`<b>${H.fmt(val)}</b><br>${dayLbl(best[0])}`;
+    let tx=px+12;if(tx>cv.clientWidth-120)tx=px-120;H.tip.style.left=tx+'px';H.tip.style.top=(py-10)+'px';
+  });
+  cv.addEventListener('pointerleave',()=>{if(cv._h){cv._h.tip.style.opacity=0;render_over(cv);}});
+}
+function render_over(cv){ // cheap redraw on hover
+  if(cv.id==='tempc'){const H=cv._h;drawTemp(H.pts.map(p=>p),DATA.warn??43,DATA.urgent??48);}
+  else{drawLevel(cv._h.pts);}
+}
+
+$('ranges').addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;
+  RANGE_H=+b.dataset.h;[...$('ranges').children].forEach(c=>c.classList.toggle('on',c===b));render();});
+hover($('tempc'));hover($('levelc'));
+window.addEventListener('resize',()=>render());
+load();setInterval(load,60000);
+</script>
+</body></html>

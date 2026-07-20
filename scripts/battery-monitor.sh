@@ -20,6 +20,7 @@ mkdir -p "$DIR"
 : "${TEMP_URGENT:=48}"     # °C  -> urgent "hot" alert (breaks through DND)
 : "${POLL_SECS:=300}"      # sample every 5 min
 : "${DIGEST_HOUR:=9}"      # local hour (0-23) for the daily report
+: "${PREFIX:=/data/data/com.termux/files/usr}"   # for the diagnostics web feed
 
 notify(){ # priority tags title message
   [ -n "$NTFY_TOPIC" ] || return 0
@@ -58,6 +59,19 @@ Now: $(jnum "$J" percentage)%, $(jnum "$J" temperature)C, health $(jstr "$J" hea
 $upline"
 }
 
+# write batt.json into the nginx docroot for the diagnostics page (diag.html).
+# Uses the module-level temp/lvl/mv/ma/health/status set each poll; last 7 days of series.
+write_web(){
+  local doc="$PREFIX/share/nginx/html"; [ -d "$doc" ] || return 0
+  local since=$(( $(date +%s) - 7*86400 )) ms upt
+  ms=$(gst mon_start); upt=$(awk -v a="${ms:-0}" -v b="$(date +%s)" 'BEGIN{if(a>0)printf "%.1f",(b-a)/3600; else printf "0.0"}')
+  { printf '{"generated":%s,"name":"%s","warn":%s,"urgent":%s,"now":{"temp":%s,"level":%s,"voltage":%s,"current":%s,"health":"%s","status":"%s","uptime_h":%s},"series":[' \
+      "$(date +%s)" "$NAME" "$TEMP_WARN" "$TEMP_URGENT" "${temp:-null}" "${lvl:-0}" "${mv:-0}" "${ma:-0}" "${health:-?}" "${status:-?}" "$upt"
+    awk -F, -v s="$since" 'BEGIN{f=1} $1>=s{if(!f)printf ","; printf "[%s,%s,%s]",$1,$2,$3; f=0}' "$LOG"
+    printf ']}'
+  } > "$doc/.batt.json.tmp" 2>/dev/null && mv "$doc/.batt.json.tmp" "$doc/batt.json" 2>/dev/null
+}
+
 # --- test hook: `battery-monitor.sh digest` sends a report immediately then exits ---
 if [ "${1:-}" = "digest" ]; then digest; echo "digest sent"; exit 0; fi
 
@@ -77,6 +91,7 @@ while true; do
 
   echo "$now,$temp,${lvl:-0},${mv:-0},${ma:-0},$health,${status:-?}" >> "$LOG"
   if [ "$(wc -l < "$LOG" 2>/dev/null || echo 0)" -gt 4000 ]; then tail -n 3000 "$LOG" > "$LOG.t"; mv "$LOG.t" "$LOG"; fi
+  write_web
 
   tempint=${temp%.*}
 
