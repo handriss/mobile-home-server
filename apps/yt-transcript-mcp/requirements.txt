@@ -1,0 +1,5 @@
+mcp>=1.28
+yt-dlp>=2026.7.4
+# Optional: enables yt-dlp --impersonate for extra robustness against YouTube blocks.
+# Not required (fetch worked without it in testing), but cheap insurance on the phone:
+# curl_cffi>=0.7
