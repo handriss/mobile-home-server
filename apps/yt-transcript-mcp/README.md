@@ -59,16 +59,42 @@ ssh -p 8022 <phone-ip> '~/yt-transcript-mcp/venv/bin/yt-dlp --skip-download --wr
 # 5. claude.ai: Settings > Connectors > add https://<your-host>/mcp  (see report re: auth)
 ```
 
-## Open question to resolve at deploy: claude.ai auth
+## Auth: Cloudflare Access (deployed)
 
-claude.ai custom connectors use **Streamable HTTP** (this server) and OAuth is
-*documented as optional*, but the connector UI historically has friction with
-no-auth servers and doesn't accept a plain bearer token. Plan: try adding it with
-no auth; if rejected, front it with Cloudflare Access or add minimal OAuth. **Do not
-leave it fully open to the internet** — an open server lets anyone use your
-residential IP to scrape YouTube (abuse + rate-limit risk).
+The public endpoint `https://yt-mcp.example.com/mcp` is gated by **Cloudflare
+Access** (Zero Trust, free tier) — a self-hosted application with an "Only me" email
+policy. Leaving it open would let anyone use the phone's residential IP to scrape
+YouTube (abuse + rate-limit risk), so it is **not** open to the internet.
+
+Crucially, Cloudflare Access speaks the **MCP OAuth flow** natively. An unauthenticated
+request gets `401/302` plus:
+
+```
+www-authenticate: Cloudflare-Access resource_metadata="…/.well-known/cloudflare-access-protected-resource/mcp"
+```
+
+which points MCP clients (claude.ai connectors, Claude Code) at the team domain's
+OAuth authorization server (`…cloudflareaccess.com/.well-known/oauth-authorization-server`).
+That server exposes `authorization`/`token`/`registration` endpoints with **PKCE (S256)
+and Dynamic Client Registration** — exactly what those clients need. So no manual
+client-ID/secret setup: the client self-registers, redirects the user to the Access
+login (One-Time PIN to the allow-listed email), and gets a token. Verified end-to-end.
+
+The server's own optional `YT_MCP_TOKEN` bearer is therefore left empty — Access is the
+gate. (Keep it empty; a second bearer would break the OAuth clients.)
+
+### Connect a client
+
+- **claude.ai (web):** Settings → Connectors → Add custom connector →
+  URL `https://yt-mcp.example.com/mcp` → complete the Cloudflare Access login.
+- **Claude Code:** `claude mcp add --transport http yt-transcript https://yt-mcp.example.com/mcp`
+  then run `/mcp` → **yt-transcript** → **Authenticate** to complete OAuth in the browser.
+  (On the home LAN you can skip auth entirely with the direct URL
+  `http://<phone-ip>:8765/mcp`, which bypasses Cloudflare.)
 
 ## Footprint
 
-Python + `mcp` (starlette/uvicorn) + yt-dlp. Server process idles at tens of MB;
-yt-dlp runs as a short-lived subprocess only on cache misses. Fine for the phone.
+Python **standard library only** + yt-dlp (see `requirements.txt`). The server process
+idles at tens of MB; yt-dlp runs as a short-lived subprocess only on cache misses.
+Fine for the phone. Fronted on-device by `cloudflared` (named tunnel), autostarted by
+Termux:Boot alongside the existing nginx / sshd / battery-monitor services.
