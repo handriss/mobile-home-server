@@ -288,8 +288,7 @@ class Handler(BaseHTTPRequestHandler):
         return f"{proto}://{host}"
 
     def _body(self):
-        n = int(self.headers.get("Content-Length", 0) or 0)
-        return self.rfile.read(n) if n else b""
+        return getattr(self, "_raw", b"")
 
     def _form(self):
         return {k: v[0] for k, v in parse_qs(self._body().decode("utf-8", "replace")).items()}
@@ -509,6 +508,12 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, b"", None)
 
     def do_POST(self):
+        # Drain the whole request body up front, on EVERY path. HTTP/1.1 keep-alive
+        # (cloudflared reuses origin connections) breaks if any branch — 401, error,
+        # 404 — returns without consuming the body: the leftover bytes get parsed as
+        # the next request line ("Unsupported method '{...}POST'").
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        self._raw = self.rfile.read(n) if n else b""
         path = urlparse(self.path).path
         if path == "/register":
             return self._register()
