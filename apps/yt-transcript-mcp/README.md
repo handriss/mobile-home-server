@@ -59,38 +59,55 @@ ssh -p 8022 <phone-ip> '~/yt-transcript-mcp/venv/bin/yt-dlp --skip-download --wr
 # 5. claude.ai: Settings > Connectors > add https://<your-host>/mcp  (see report re: auth)
 ```
 
-## Auth: Cloudflare Access (deployed)
+## Auth: the server is its own OAuth authority
 
-The public endpoint `https://yt-mcp.example.com/mcp` is gated by **Cloudflare
-Access** (Zero Trust, free tier) — a self-hosted application with an "Only me" email
-policy. Leaving it open would let anyone use the phone's residential IP to scrape
-YouTube (abuse + rate-limit risk), so it is **not** open to the internet.
+We tried Cloudflare Access first. It **doesn't work**: a self-hosted Access app
+advertises a DCR endpoint in its OAuth metadata but returns **404** on it, so claude.ai
+can't register (*"Couldn't register with … sign-in service"*). Cloudflare's supported
+"MCP server portal" is the intended path, but **claude.ai *web* is broken against
+Cloudflare Managed OAuth** — Anthropic issue
+[#410](https://github.com/anthropics/claude-ai-mcp/issues/410), *closed as not-planned*
+(Claude Code works; the web/mobile connector fails at Connect). So relying on
+Cloudflare's OAuth is a dead end for the web client.
 
-Crucially, Cloudflare Access speaks the **MCP OAuth flow** natively. An unauthenticated
-request gets `401/302` plus:
+Instead, **`server.py` speaks OAuth itself** — ~150 lines of stdlib implementing the
+slice MCP clients need, so it works for both claude.ai web and Claude Code and doesn't
+depend on Cloudflare. Cloudflare Access is **removed**; the tunnel just relays and the
+server authenticates.
 
-```
-www-authenticate: Cloudflare-Access resource_metadata="…/.well-known/cloudflare-access-protected-resource/mcp"
-```
+What it implements:
 
-which points MCP clients (claude.ai connectors, Claude Code) at the team domain's
-OAuth authorization server (`…cloudflareaccess.com/.well-known/oauth-authorization-server`).
-That server exposes `authorization`/`token`/`registration` endpoints with **PKCE (S256)
-and Dynamic Client Registration** — exactly what those clients need. So no manual
-client-ID/secret setup: the client self-registers, redirects the user to the Access
-login (One-Time PIN to the allow-listed email), and gets a token. Verified end-to-end.
+- **RFC 9728** protected-resource metadata + **RFC 8414** authorization-server metadata
+  (`/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`)
+- **RFC 7591** dynamic client registration (`/register`) — clients self-register, no
+  manual client-ID/secret
+- **Authorization code + PKCE (S256)** (`/authorize`, `/token`), codes single-use
+- **Owner-password consent gate** on `/authorize` — approving a client requires the
+  owner password, so only you can grant access. *This is what protects the phone's
+  residential IP.* Access tokens last 24 h, refresh tokens 90 d.
+- Unauthenticated `/mcp` → `401` with
+  `WWW-Authenticate: Bearer resource_metadata="…"` so clients start the flow.
 
-The server's own optional `YT_MCP_TOKEN` bearer is therefore left empty — Access is the
-gate. (Keep it empty; a second bearer would break the OAuth clients.)
+Tokens are **stateless HMAC blobs** (key in `~/.config/yt-mcp/oauth_secret`), so they
+survive a server restart. A **static bearer** (`~/.config/yt-mcp/bearer_token`, or
+`YT_MCP_TOKEN`) is also accepted on `/mcp` — handy for CLI clients that would rather
+pass a header than do interactive OAuth.
+
+Config lives in `~/.config/yt-mcp/` on the phone (auto-generated, `0600`):
+`password` (owner consent password — override with `YT_MCP_AUTH_PASSWORD`),
+`oauth_secret` (token signing key), `bearer_token` (static CLI bearer).
 
 ### Connect a client
 
 - **claude.ai (web):** Settings → Connectors → Add custom connector →
-  URL `https://yt-mcp.example.com/mcp` → complete the Cloudflare Access login.
-- **Claude Code:** `claude mcp add --transport http yt-transcript https://yt-mcp.example.com/mcp`
-  then run `/mcp` → **yt-transcript** → **Authenticate** to complete OAuth in the browser.
-  (On the home LAN you can skip auth entirely with the direct URL
-  `http://<phone-ip>:8765/mcp`, which bypasses Cloudflare.)
+  URL `https://yt-mcp.example.com/mcp` → Connect. It self-registers, then shows the
+  server's consent page → enter the **owner password** → connected.
+- **Claude Code (OAuth):** `claude mcp add --transport http yt-transcript https://yt-mcp.example.com/mcp`
+  then `/mcp` → **yt-transcript** → **Authenticate** (browser consent, owner password).
+- **Claude Code (static bearer, no browser):**
+  `claude mcp add --transport http yt-transcript https://yt-mcp.example.com/mcp --header "Authorization: Bearer <bearer_token>"`
+- **Home LAN shortcut:** the direct URL `http://<phone-ip>:8765/mcp` still needs a
+  bearer/OAuth too now (the server always authenticates), but is reachable without the tunnel.
 
 ## Footprint
 
