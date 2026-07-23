@@ -2,3 +2,5 @@ cache/
 *.apk
 .DS_Store
 .idea/
+__pycache__/
+*.pyc
