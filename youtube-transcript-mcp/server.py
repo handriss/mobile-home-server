@@ -760,7 +760,7 @@ def dispatch(method, params):
         return {
             "protocolVersion": pv if pv in PROTOCOL_VERSIONS else "2025-06-18",
             "capabilities": {"tools": {"listChanged": False}, "prompts": {"listChanged": False}},
-            "serverInfo": {"name": "youtube-transcript", "version": "2.0.0"},
+            "serverInfo": {"name": "youtube-transcript", "version": "2.0.1"},
         }
     if method == "tools/list":
         return {"tools": TOOLS}
