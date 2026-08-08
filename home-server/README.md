@@ -3,7 +3,10 @@
 Turn a spare Android phone into an always-on **Termux + nginx** web server, provisioned
 from a Mac over ADB with **minimal human intervention**. Repeatable for any phone.
 
-Built and validated on an **OPPO Reno5 Z (CPH2211), Android 13 / ColorOS**.
+Works on any Termux-capable Android phone; built and validated on an **OPPO Reno5 Z
+(CPH2211), Android 13 / ColorOS**. See [Portability](../README.md#portability) for the
+four things that differ on other handsets — chiefly the ADB tap coordinates in
+`provision.sh`.
 
 ---
 
