@@ -16,12 +16,10 @@ public access via Cloudflare Tunnel (works behind CGNAT / DS-Lite). See its
 ## [`youtube-transcript-mcp/`](youtube-transcript-mcp/) — YouTube transcript MCP server
 
 A remote **MCP server** (Streamable HTTP) exposing a `get_transcript` tool to claude.ai and
-Claude Code. It **runs on the phone on purpose**, so the YouTube fetch (via `yt-dlp`) goes
-out from the phone's Hungarian residential IP — YouTube's caption endpoint rejects
-datacenter IPs. Pure Python standard library + `yt-dlp`, with disk caching, cursor
-pagination, and a built-in **OAuth 2.1 (PKCE + DCR, owner-password consent)** layer so it's
-safe to expose through the Cloudflare Tunnel. See its
-[README](youtube-transcript-mcp/README.md).
+Claude Code, running **on-device** rather than on hosted infrastructure. Pure Python
+standard library + `yt-dlp`, with disk caching, cursor pagination, and a built-in
+**OAuth 2.1 (PKCE + DCR, owner-password consent)** layer so it's safe to expose through the
+Cloudflare Tunnel. See its [README](youtube-transcript-mcp/README.md).
 
 ---
 

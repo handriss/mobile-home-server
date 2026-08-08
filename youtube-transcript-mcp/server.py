@@ -7,8 +7,8 @@ won't build on Termux/Android. This hand-rolls the small slice of the MCP Stream
 HTTP protocol we need (initialize / tools.list / tools.call / ping) so it runs on the
 phone with only the standard library + yt-dlp. Protocol-verified against Claude Code.
 
-WHY ON THE PHONE: the yt-dlp fetch must go out from the Oppo's Hungarian residential
-IP. A Cloudflare tunnel in front only relays inbound MCP; the fetch still leaves here.
+WHY ON THE PHONE: no hosted runtime to pay for or maintain. A Cloudflare tunnel in
+front only relays inbound MCP; the fetch itself happens on-device.
 WHY yt-dlp: youtube-captions-scraper / youtubei.js are broken vs current YouTube (2026-07);
 yt-dlp works — verified on the phone (title + transcript, EN/ES, short/long).
 
@@ -70,8 +70,9 @@ _cost_lock    = threading.Lock()
 # server.py is the auth authority (Cloudflare Access's DCR endpoint 404s, and claude.ai
 # web is broken against CF Managed OAuth — see README). We speak just enough OAuth 2.1
 # (PKCE + RFC 7591 DCR) for claude.ai + Claude Code to self-register and get a token,
-# gated by an owner password so only you can approve — that's what protects the phone's
-# residential IP. A static bearer (YT_MCP_TOKEN) is also accepted for CLI convenience.
+# gated by an owner password so only you can approve — the tunnel is public, so that
+# password is the whole perimeter. A static bearer (YT_MCP_TOKEN) is also accepted for
+# CLI convenience.
 CONF_DIR = os.environ.get("YT_MCP_CONF", os.path.expanduser("~/.config/yt-mcp"))
 os.makedirs(CONF_DIR, exist_ok=True)
 

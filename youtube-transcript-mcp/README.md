@@ -1,14 +1,12 @@
 # YouTube Transcript MCP server (on the phone)
 
 A remote MCP server (Streamable HTTP) exposing a `get_transcript` tool to claude.ai.
-It **runs on the Oppo phone on purpose** so the YouTube request goes out from the
-phone's Hungarian residential IP. A Cloudflare tunnel in front only relays the
-*inbound* MCP protocol; the outbound fetch still originates on the phone.
+It runs **on the phone**, so there is no hosted runtime to pay for or maintain — the
+Cloudflare tunnel in front only relays the *inbound* MCP protocol.
 
 ## Why yt-dlp (not the referenced npm package)
 
-Verified 2026-07-20 from a **Hungarian residential IP** (Yettel mobile, same class
-as the phone):
+Verified 2026-07-20 from an ordinary consumer connection:
 
 | Fetcher | Result |
 |---|---|
@@ -16,8 +14,8 @@ as the phone):
 | `youtubei.js` (InnerTube) | **HTTP 400** — stale `get_transcript` request |
 | **`yt-dlp`** | **✅ works** — real captions returned |
 
-So the blocker isn't only datacenter IPs — the common Node libraries are broken
-against current YouTube regardless of IP. yt-dlp stays current, so it's the fetcher.
+The common Node libraries are simply broken against current YouTube. yt-dlp stays
+current, so it's the fetcher.
 The referenced package was also missing most of its advertised features (no Shorts,
 no language fallback, no timestamps, no ad-stripping) — see the main report.
 
@@ -27,7 +25,7 @@ timestamps, cursor pagination reconstructing a transcript exactly).
 ## What it does
 
 All tools accept full URLs (watch / Shorts / youtu.be / embed / live) or a bare 11-char ID,
-and go out from the phone's residential IP.
+and are fetched on-device.
 
 **Text (zero cost, no extra deps):**
 - **`get_transcript(url, lang="en", timestamps=False, cursor="")`** — title + transcript.
@@ -77,7 +75,7 @@ ssh -p 8022 <phone-ip> 'pkg install -y python && python -m venv ~/yt-transcript-
 scp -O -P 8022 server.py requirements.txt <phone-ip>:yt-transcript-mcp/
 ssh -p 8022 <phone-ip> '~/yt-transcript-mcp/venv/bin/pip install -r ~/yt-transcript-mcp/requirements.txt'
 
-# 1. VERIFY FETCHING ON THE PHONE FIRST (the real residential-IP test):
+# 1. VERIFY FETCHING ON THE PHONE FIRST:
 ssh -p 8022 <phone-ip> '~/yt-transcript-mcp/venv/bin/yt-dlp --skip-download --write-auto-subs \
     --sub-langs en --sub-format json3 -o /tmp/t "https://youtu.be/jNQXAC9IVRw" && ls /tmp/t*.json3'
 #    -> if this returns NO json3 file, STOP: fetching doesn't work even on the phone;
@@ -115,8 +113,9 @@ What it implements:
   manual client-ID/secret
 - **Authorization code + PKCE (S256)** (`/authorize`, `/token`), codes single-use
 - **Owner-password consent gate** on `/authorize` — approving a client requires the
-  owner password, so only you can grant access. *This is what protects the phone's
-  residential IP.* Access tokens last 24 h, refresh tokens 90 d.
+  owner password, so only you can grant access. *This is the whole perimeter: the
+  tunnel is public, so this password is what keeps strangers off your phone.*
+  Access tokens last 24 h, refresh tokens 90 d.
 - Unauthenticated `/mcp` → `401` with
   `WWW-Authenticate: Bearer resource_metadata="…"` so clients start the flow.
 

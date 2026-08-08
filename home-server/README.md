@@ -73,6 +73,12 @@ lines, battery-level chart, live stat tiles, 24h/3d/7d toggle, auto-refresh). Th
 monitor writes `batt.json` into the docroot every 5 min, so the page just loads:
 **`http://<phone-ip>:8080/diag.html`**. No server-side code — nginx serves static files.
 
+> **Keep this on the LAN.** `batt.json` sits in the docroot and is served without any
+> authentication, so anyone who can reach nginx gets 7 days of battery, temperature and
+> uptime samples — which is a presence side channel: it shows when the device charges and
+> when it rebooted. If you put the Cloudflare Tunnel in front of port 8080, put Cloudflare
+> Access (or at least basic auth) in front of it too.
+
 ---
 
 ## Maintenance from the Mac

@@ -4,3 +4,6 @@ cache/
 .idea/
 __pycache__/
 *.pyc
+
+# Agent working notes — internal, not for publication
+CLAUDE.md
