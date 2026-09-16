@@ -266,7 +266,7 @@ case "${1:-start}" in
     echo "loop:    $(ps -ef 2>/dev/null | grep -q '[s]oak-loop' && echo RUNNING || echo stopped)"
     echo "stack:   $(stack_up && echo up || echo DOWN)"
     echo "cycles:  $(( $(wc -l < "$CSV" 2>/dev/null || echo 1) - 1 ))"
-    echo "aborted: $(grep -c '"evt":"abort"' "$EVT" 2>/dev/null || echo 0)"
+    echo "aborted: $(grep -c '"evt":"abort"' "$EVT" 2>/dev/null; true)"
     echo "mem:     $(memavail) kB avail"
     echo "--- last 8 cycles ---"; tail -8 "$CSV" 2>/dev/null
     ;;
