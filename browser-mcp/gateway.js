@@ -27,6 +27,7 @@ const fs = require('node:fs');
 const net = require('node:net');
 const { execFileSync, execFile } = require('node:child_process');
 const auth = require('./auth.js');
+const profiles = require('./profiles.js');
 
 const LISTEN_HOST = process.env.GW_HOST || '127.0.0.1';
 const LISTEN_PORT = Number(process.env.GW_PORT || 8930);
@@ -219,6 +220,30 @@ function readBody(req) {
   });
 }
 
+/**
+ * Re-send a fully buffered upstream response.
+ *
+ * The upstream answers with Transfer-Encoding: chunked. Once we have buffered the body we
+ * are sending a fixed-length response, so that header must go -- forwarding it alongside a
+ * Content-Length is invalid HTTP. curl tolerates the contradiction, which is why the
+ * on-device soak never caught this, but undici (Node fetch, and therefore Claude Code and
+ * claude.ai) rejects the response with UND_ERR_HTTP_PARSER. Hop-by-hop headers must not be
+ * forwarded by a proxy either (RFC 9110 7.6.1).
+ */
+const HOP_BY_HOP = ['transfer-encoding', 'connection', 'keep-alive', 'upgrade',
+                    'proxy-authenticate', 'proxy-authorization', 'te', 'trailer'];
+function sendBuffered(res, status, headers, bodyBuf) {
+  if (res.headersSent) return;
+  const h = { ...headers };
+  for (const k of Object.keys(h)) {
+    if (HOP_BY_HOP.includes(k.toLowerCase())) delete h[k];
+  }
+  delete h['content-length'];
+  h['content-length'] = Buffer.byteLength(bodyBuf);
+  res.writeHead(status, h);
+  res.end(bodyBuf);
+}
+
 function jsonRpcError(res, id, code, message, data) {
   const payload = JSON.stringify({ jsonrpc: '2.0', id: id ?? null, error: { code, message, data } });
   res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) });
@@ -236,13 +261,17 @@ function chromeProcCount() {
  * `buffer`: collect the whole response so we can inspect/rewrite it (POST tool calls).
  * Streaming is used for GET /mcp, which is a long-lived notification channel.
  */
-function proxy(req, res, body, { buffer }) {
+function proxy(req, res, body, { buffer, port = UP_PORT, upstreamPath = null }) {
   return new Promise((resolve) => {
-    const headers = { ...req.headers, host: `localhost:${UP_PORT}` };
+    // @playwright/mcp rejects any request whose Host is not what it bound to, so the
+    // Host must name the *target* port, not the gateway's. Profile routes also have to
+    // be rewritten: the client says /mcp/linkedin, the upstream only knows /mcp.
+    const headers = { ...req.headers, host: `localhost:${port}` };
     delete headers['content-length'];
     if (body && body.length) headers['content-length'] = Buffer.byteLength(body);
+    const target = upstreamPath || req.url;
 
-    const up = http.request({ host: UP_HOST, port: UP_PORT, path: req.url, method: req.method, headers }, (ur) => {
+    const up = http.request({ host: UP_HOST, port, path: target, method: req.method, headers }, (ur) => {
       if (!buffer) {
         res.writeHead(ur.statusCode, ur.headers);
         ur.pipe(res);
@@ -254,10 +283,10 @@ function proxy(req, res, body, { buffer }) {
       ur.on('end', () => resolve({ status: ur.statusCode, headers: ur.headers, body: Buffer.concat(chunks) }));
     });
     up.on('error', (e) => {
-      log('upstream_error', { err: e.message });
+      log('upstream_error', { err: e.message, port });
       if (!res.headersSent) {
         jsonRpcError(res, null, -32001,
-          `Browser backend unreachable on ${UP_HOST}:${UP_PORT}. The MCP server may be restarting; retry in a few seconds.`);
+          `Browser backend unreachable on ${UP_HOST}:${port}. The MCP server may be restarting; retry in a few seconds.`);
       } else { res.end(); }
       resolve(null);
     });
@@ -313,29 +342,49 @@ const server = http.createServer(async (req, res) => {
       },
       limits: { idle_release_ms: IDLE_RELEASE_MS, max_wait_ms: MAX_WAIT_MS },
       stats,
+      profiles: profiles.status(),
       chrome_processes: Number(chromeProcCount()),
     }, null, 2);
     res.writeHead(200, { 'content-type': 'application/json' });
     return res.end(payload);
   }
 
-  if (!req.url.startsWith('/mcp')) {
+  // Named profiles (#5). /mcp is the default profile; /mcp/<name> selects another,
+  // each backed by its own upstream with its own --user-data-dir, so cookies and
+  // logins are isolated and survive restarts.
+  const route = profiles.routeOf(req.url);
+  if (!route) {
     res.writeHead(404, { 'content-type': 'application/json' });
     return res.end('{"error":"not found"}');
   }
+  if (route.error) {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({ error: route.error }));
+  }
+
+  let upstream;
+  try {
+    upstream = await profiles.ensure(route.profile);
+  } catch (e) {
+    log('profile_unavailable', { profile: route.profile, err: e.message });
+    return jsonRpcError(res, null, -32006,
+      `Could not start a browser for profile "${route.profile}": ${e.message}`,
+      { profile: route.profile, retry_after_s: 30 });
+  }
+  const P = { port: upstream.port, upstreamPath: route.upstreamPath };
 
   const sid = req.headers['mcp-session-id'] || null;
 
   // Session teardown: let it through, then hand the browser to whoever is next.
   if (req.method === 'DELETE') {
-    await proxy(req, res, body, { buffer: false });
+    await proxy(req, res, body, { buffer: false, ...P });
     if (sid) { upstreamSessions.delete(sid); saveSessions(); }
     if (sid && lock.owner === sid) release('session_closed');
     return;
   }
 
   // GET /mcp is the SSE notification channel -- stream it, never buffer.
-  if (req.method === 'GET') return void (await proxy(req, res, body, { buffer: false }));
+  if (req.method === 'GET') return void (await proxy(req, res, body, { buffer: false, ...P }));
 
   let rpc = null;
   try { rpc = JSON.parse(body.toString('utf8')); } catch { /* forward opaquely */ }
@@ -344,11 +393,11 @@ const server = http.createServer(async (req, res) => {
   const needsBrowser = typeof toolName === 'string' && toolName.startsWith('browser_');
 
   if (!needsBrowser) {
-    const r = await proxy(req, res, body, { buffer: true });
+    const r = await proxy(req, res, body, { buffer: true, ...P });
     // Learn the session id handed out by initialize, so we can clean it up later.
     const newSid = r?.headers?.['mcp-session-id'];
     if (newSid) { upstreamSessions.set(newSid, Date.now()); saveSessions(); log('session_opened', { sid: shortSid(newSid) }); }
-    if (r && !res.headersSent) { res.writeHead(r.status, r.headers); res.end(r.body); }
+    if (r) sendBuffered(res, r.status, r.headers, r.body);
     return;
   }
 
@@ -369,10 +418,11 @@ const server = http.createServer(async (req, res) => {
       { retry_after_s: 60, waited_s: Math.round(e.waitedMs / 1000) });
   }
 
+  profiles.touch(route.profile);
   if (ticket.queued) log('lock_acquired_after_wait', { sid: shortSid(sid), tool: toolName, waitedMs: ticket.waitedMs });
   lock.lastActivity = Date.now();
 
-  let r = await proxy(req, res, body, { buffer: true });
+  let r = await proxy(req, res, body, { buffer: true, ...P });
   lock.lastActivity = Date.now();
 
   // We hold the lock, so an in-use error means an untracked upstream session is
@@ -382,7 +432,7 @@ const server = http.createServer(async (req, res) => {
     log('upstream_in_use', { sid: shortSid(sid), tool: toolName, action: 'reconciling' });
     const dropped = await reconcileUpstream(sid);
     if (dropped > 0) {
-      r = await proxy(req, res, body, { buffer: true });
+      r = await proxy(req, res, body, { buffer: true, ...P });
       lock.lastActivity = Date.now();
       log('retry_after_reconcile', { sid: shortSid(sid), tool: toolName,
         ok: r ? !BROWSER_IN_USE.test(r.body.toString('utf8')) : false });
@@ -436,13 +486,7 @@ const server = http.createServer(async (req, res) => {
         'Run "job-search-pipeline/start.sh restart" on the device. Original error');
       out = Buffer.from(text, 'utf8');
     }
-    if (!res.headersSent) {
-      const h = { ...r.headers };
-      delete h['content-length'];
-      h['content-length'] = Buffer.byteLength(out);
-      res.writeHead(r.status, h);
-      res.end(out);
-    }
+    sendBuffered(res, r.status, r.headers, out);
   }
 
   // browser_close ends the browser session; release immediately rather than
@@ -451,6 +495,9 @@ const server = http.createServer(async (req, res) => {
 });
 
 loadSessions();
+// start.sh launches one upstream itself; adopt it as the default profile so we never
+// spawn a second browser onto the same --user-data-dir.
+profiles.adoptStatic(UP_PORT, process.env.PROFILE || null);
 
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
   log('listening', { host: LISTEN_HOST, port: LISTEN_PORT, upstream: `${UP_HOST}:${UP_PORT}`,

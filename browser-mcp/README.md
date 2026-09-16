@@ -169,6 +169,51 @@ element and get its `ref`, and `browser_evaluate` to pull specific text; reserve
 (`{"evt":"snapshot_size"}`); set `GW_MAX_SNAPSHOT_BYTES` to refuse oversized ones with a
 message pointing at the cheaper tools.
 
+## Named profiles
+
+`/mcp` is the default profile; **`/mcp/<name>`** selects another. Each profile gets its own
+`@playwright/mcp` upstream with its own `--user-data-dir`, spawned on first use and torn
+down after `GW_PROFILE_IDLE_MS` of silence.
+
+```
+https://browser.quietharbors.org/mcp            -> profile "default"
+https://browser.quietharbors.org/mcp/work       -> profile "work"
+https://browser.quietharbors.org/mcp/personal   -> profile "personal"
+```
+
+Point each agent at the URL for the profile it should use. Names are `[a-z0-9_-]`, max 32
+chars; anything else gets a 400.
+
+Verified end-to-end through the gateway against real browsers:
+
+| Check | Result |
+|---|---|
+| Cookies + localStorage survive a full upstream stop and restart on a new port | pass |
+| `work`, `personal` and `default` each read back only their own state | pass |
+| An unused profile starts empty | pass |
+| Concurrent first-use of one profile shares a single spawn (no double browser on one dir) | pass |
+| LRU eviction past `GW_MAX_LIVE_PROFILES` | pass |
+
+`start.sh` launches one upstream itself; the gateway **adopts** it as the default profile
+rather than spawning a second browser onto the same directory.
+
+| Env | Default | Meaning |
+|---|---|---|
+| `GW_DEFAULT_PROFILE` | `default` | profile used for bare `/mcp` |
+| `GW_MAX_LIVE_PROFILES` | 2 | browsers alive at once — this is a phone |
+| `GW_PROFILE_IDLE_MS` | 600000 | idle before a profile's browser is torn down |
+| `GW_PROFILE_PORT_BASE` | 8940 | first port for spawned upstreams |
+
+> Concurrency is still **globally serialized** — one page load at a time across all
+> profiles. Profiles give isolation and persistence, not parallelism. Per-profile parallel
+> locking is #6.
+
+### Logging into a profile by hand
+
+VNC to the display, drive the browser yourself, and the session lands in that profile's
+directory. See below — but note the VNC display currently shows the **default** profile's
+browser. Attaching a hand-login flow to an arbitrary named profile is not wired yet.
+
 ## Logging in by hand
 
 The browser runs on a real X display, so you can drive it yourself and leave the
@@ -235,6 +280,7 @@ Cost of headed: cold start 730ms vs 519ms. Worth it.
 ```
 gateway.js            the queue / status / logging front-end
 auth.js               OAuth 2.1 authority + static bearer (see Authentication)
+profiles.js           per-profile upstream pool: spawn, adopt, evict, idle teardown
 start.sh              brings the stack up in order
 test-concurrency.sh   fires N simultaneous clients, shows they serialize
 soak.sh               unattended endurance test, with guard rails (see below)
