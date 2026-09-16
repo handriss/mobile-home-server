@@ -153,6 +153,47 @@ alongside the yt-mcp one, and create the DNS record. `@playwright/mcp` rejects r
 `Host` is not what it bound to — the gateway already rewrites `Host` when proxying upstream,
 so that is handled, but re-check it after the first live request.
 
+## Co-tenancy: what else lives on this phone
+
+This is not a dedicated device. nginx (:8080), yt-transcript-MCP (:8765), Forgejo (:3000),
+forgejo-MCP (:8766) and the battery monitor all share it. **Memory has never been the
+constraint** (~4.5 GB free with two Chromiums running); the failures have been individual
+processes dying or wedging.
+
+Two incidents on 2026-09-16, both in windows just after the probe suite ran:
+
+- **sshd died** — recovered by the Forgejo watchdog ~11 min later. `supervise.sh` now watches
+  it every 15 s instead.
+- **forgejo-MCP wedged** — the process was alive but unresponsive, and stayed that way ~5.5 h
+  because nothing started or watched it. Now has `~/.termux/boot/55-forgejo-mcp.sh` and is in
+  the soak's neighbour list.
+
+Correlation with the probe suite is **unproven** — `probe_shed` fires `GW_MAX_QUEUE+3`
+simultaneous clients, which is the obvious suspect, but two earlier causal theories about
+these incidents turned out to be wrong. Until it is understood, run genuinely unattended
+soaks with `SOAK_PROBE_EVERY=0` and run probes by hand while watching:
+
+```sh
+SOAK_PROBE_EVERY=0 SOAK_NEIGHBOURS="8080:nginx 8765:yt-mcp 3000:forgejo 8766:forgejo-mcp" \
+  ./soak.sh start
+```
+
+### Diagnosing a dead service from off-LAN
+
+Probe the **tunnel hostname**, never the LAN port — Forgejo, forgejo-MCP and the gateway all
+bind `127.0.0.1`, so an external port scan always reads "down" whether they are healthy or
+not. Through the tunnel, **502 means the tunnel is up but the origin is not answering**
+(process dead or wedged); 302/404 means healthy.
+
+### Two process-identification traps on this device
+
+- `pgrep -f <pattern>` run inside an `ssh ... '<script>'` **matches the script's own command
+  line**. Use `ps -ef | grep "[p]attern"` instead.
+- yt-MCP and forgejo-MCP both run as `python -u server.py` — argv cannot tell them apart.
+  Identify by `/proc/<pid>/cwd`, as `forgejo-mcp/run.sh` does. `~/.termux/boot/30-yt-mcp.sh`
+  guards with a bare `pgrep -f server.py`, which is why the forgejo-MCP boot script must be
+  numbered **after** it.
+
 ## Snapshot cost
 
 `browser_snapshot` on a large page is very expensive. Measured on this device:
