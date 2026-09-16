@@ -141,10 +141,11 @@ live phone or through the tunnel.**
 ## Deploying the tunnel
 
 Not yet done. `BROWSER_MCP_PUBLIC_URL` **must** be set when exposing this, so OAuth metadata
-advertises a fixed origin rather than trusting the `Host` header:
+advertises a fixed origin rather than trusting the `Host` header. The chosen hostname is
+**`browser.quietharbors.org`**:
 
 ```sh
-BROWSER_MCP_PUBLIC_URL=https://browser.example.org ./start.sh restart
+BROWSER_MCP_PUBLIC_URL=https://browser.quietharbors.org ./start.sh restart
 ```
 
 Then add an ingress rule to the phone's existing named tunnel (`~/.cloudflared/config.yml`),
