@@ -26,15 +26,25 @@ STOP="$LAB/.soak-stop"
 PORT="${GW_PORT:-8930}"
 BASE="http://127.0.0.1:$PORT/mcp"
 INTERVAL="${SOAK_INTERVAL:-1800}"      # 30 min, per ticket #2
-PROBE_EVERY="${SOAK_PROBE_EVERY:-4}"   # run corner-case probes every Nth cycle
+# Run corner-case probes every Nth cycle; 0 disables them entirely.
+# The probe suite is deliberately aggressive (probe_shed fires GW_MAX_QUEUE+3 clients at
+# once). Two co-tenant services died on 2026-09-16 in windows when it had just run. Until
+# that correlation is understood, consider SOAK_PROBE_EVERY=0 for genuinely unattended runs
+# and run probes by hand while watching.
+PROBE_EVERY="${SOAK_PROBE_EVERY:-4}"
 STACK="$HERE/start.sh"
 
 # ---- guard rails ------------------------------------------------------------
 ABORT_TEMP_C="${SOAK_ABORT_TEMP_C:-43}"          # same threshold as battery-monitor
 ABORT_MEM_KB="${SOAK_ABORT_MEM_KB:-1572864}"     # 1.5 GiB MemAvailable floor
 NEIGHBOUR_FAILS="${SOAK_NEIGHBOUR_FAILS:-3}"     # consecutive failures before abort
-# host:port:label — the co-tenants this soak must not take down
-NEIGHBOURS=("8080:nginx" "8765:yt-mcp" "3000:forgejo")
+# port:label — the co-tenants this soak must not take down. Override with
+# SOAK_NEIGHBOURS="8080:nginx 8765:yt-mcp 3000:forgejo 3001:forgejo-mcp".
+#
+# NOTE: forgejo-mcp (the server behind the Forgejo MCP connector) is NOT in this default
+# list because its local port has not been confirmed on the device yet. It died unnoticed
+# on 2026-09-16 precisely because nothing was watching it. Confirm the port and add it.
+NEIGHBOURS=(${SOAK_NEIGHBOURS:-"8080:nginx" "8765:yt-mcp" "3000:forgejo"})
 
 NTFY_URL="${NTFY_URL:-https://ntfy.sh}"
 NTFY_TOPIC="${NTFY_TOPIC:-$(grep -m1 '^NTFY_TOPIC=' "$HOME/batt-monitor/monitor.conf" 2>/dev/null | cut -d= -f2)}"
