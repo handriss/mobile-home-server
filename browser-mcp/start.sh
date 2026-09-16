@@ -57,8 +57,13 @@ start_all() {
   fi
 
   if ! up 'gateway.js'; then
-    echo ">> gateway (queue) on 127.0.0.1:$GW_PORT"
+    echo ">> gateway (queue+auth) on 127.0.0.1:$GW_PORT"
+    # BROWSER_MCP_PUBLIC_URL pins the OAuth issuer/endpoints. Behind the tunnel it MUST
+    # be set, or a spoofed Host header could redirect a client's whole auth flow.
+    # GW_MAX_SNAPSHOT_BYTES: 0 = log snapshot sizes only; set a cap to refuse huge ones.
     GW_PORT="$GW_PORT" GW_UPSTREAM_PORT="$MCP_PORT" \
+    BROWSER_MCP_PUBLIC_URL="${BROWSER_MCP_PUBLIC_URL:-}" \
+    GW_MAX_SNAPSHOT_BYTES="${GW_MAX_SNAPSHOT_BYTES:-0}" \
       setsid node "$HERE/gateway.js" >> "$LAB/gateway.log" 2>&1 < /dev/null &
     sleep 3
   fi

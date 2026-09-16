@@ -26,6 +26,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const net = require('node:net');
 const { execFileSync, execFile } = require('node:child_process');
+const auth = require('./auth.js');
 
 const LISTEN_HOST = process.env.GW_HOST || '127.0.0.1';
 const LISTEN_PORT = Number(process.env.GW_PORT || 8930);
@@ -39,6 +40,10 @@ const IDLE_RELEASE_MS = Number(process.env.GW_IDLE_RELEASE_MS || 120_000);
 const MAX_WAIT_MS = Number(process.env.GW_MAX_WAIT_MS || 300_000);
 // Hard ceiling on parked callers; beyond this we shed load instead of thrashing.
 const MAX_QUEUE = Number(process.env.GW_MAX_QUEUE || 8);
+// Refuse browser_snapshot responses larger than this, pointing the caller at the far
+// cheaper browser_find / browser_evaluate. 0 disables the cap (sizes are still logged).
+// Default off: visibility first, enforcement once you know your own page mix.
+const MAX_SNAPSHOT_BYTES = Number(process.env.GW_MAX_SNAPSHOT_BYTES || 0);
 
 const startedAt = Date.now();
 const log = (evt, fields = {}) =>
@@ -271,6 +276,26 @@ const server = http.createServer(async (req, res) => {
   // hit once with the transcript MCP server.
   const body = req.method === 'POST' || req.method === 'PUT' ? await readBody(req) : Buffer.alloc(0);
 
+  // Requests arriving through cloudflared also originate from 127.0.0.1, so the socket
+  // address alone cannot distinguish them. cloudflared always stamps forwarding headers;
+  // their absence on a loopback socket means a genuinely on-device caller (soak.sh,
+  // start.sh). Those keep working without a token; everything off-device must authenticate.
+  const viaTunnel = !!(req.headers['x-forwarded-for'] || req.headers['cf-connecting-ip'] ||
+                       req.headers['cf-ray'] || req.headers['x-forwarded-proto']);
+  const sock = req.socket.remoteAddress || '';
+  const trustedLocal = !viaTunnel && (sock === '127.0.0.1' || sock === '::1' || sock === '::ffff:127.0.0.1');
+
+  // OAuth discovery / registration / consent / token. Must come before the auth gate:
+  // these are how a client *obtains* a token, so they cannot require one.
+  if (auth.handleAuthRoutes(req, res, body.toString('utf8'))) return;
+
+  // Ticket #4: no unauthenticated path, ever -- including health checks that leak anything.
+  // /status exposes queue state and process counts, so it is gated too.
+  if (!trustedLocal && !auth.isAuthed(req)) {
+    log('unauthorized', { path: req.url, method: req.method, via_tunnel: viaTunnel });
+    return auth.unauthorized(req, res);
+  }
+
   if (req.method === 'GET' && req.url === '/status') {
     const payload = JSON.stringify({
       ok: true,
@@ -378,6 +403,31 @@ const server = http.createServer(async (req, res) => {
 
   if (r) {
     let out = r.body;
+
+    // Snapshot cost guard. A full aria snapshot of a big page is enormous -- measured
+    // on this device, Wikipedia's "Android" article is 1,302,514 bytes (~326k tokens,
+    // about $1.63 of Opus 5 input on a single call, and a third of a 1M context window).
+    // It also gets re-sent on every subsequent turn of an agent loop. browser_find and
+    // browser_evaluate answer the same questions for a fraction of that: the same page
+    // costs ~5.9k tokens via find and ~150 via evaluate.
+    //
+    // Always log the size so the cost is visible. Refuse only if a hard cap is set,
+    // because a refusal is better than a surprise bill but worse than a working agent.
+    if (toolName === 'browser_snapshot') {
+      const bytes = Buffer.byteLength(out);
+      log('snapshot_size', { sid: shortSid(sid), bytes, approx_tokens: Math.round(bytes / 4) });
+      if (MAX_SNAPSHOT_BYTES > 0 && bytes > MAX_SNAPSHOT_BYTES) {
+        log('snapshot_refused', { sid: shortSid(sid), bytes, cap: MAX_SNAPSHOT_BYTES });
+        release('snapshot_refused');
+        return jsonRpcError(res, rpc?.id, -32005,
+          `This page's accessibility snapshot is ${Math.round(bytes / 1024)} kB (~${Math.round(bytes / 4000)}k tokens), ` +
+          `over the ${Math.round(MAX_SNAPSHOT_BYTES / 1024)} kB cap. Use browser_find ({"text": "..."} or {"regex": "..."}) ` +
+          `to locate an element and get its ref, or browser_evaluate to extract just the text you need — ` +
+          `both are orders of magnitude cheaper. Raise GW_MAX_SNAPSHOT_BYTES if you really do need the whole tree.`,
+          { snapshot_bytes: bytes, cap_bytes: MAX_SNAPSHOT_BYTES, cheaper_tools: ['browser_find', 'browser_evaluate'] });
+      }
+    }
+
     // Still wedged after reconciling: replace the bare Playwright string with
     // something the operator can actually act on.
     if (BROWSER_IN_USE.test(out.toString('utf8'))) {
@@ -404,7 +454,9 @@ loadSessions();
 
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
   log('listening', { host: LISTEN_HOST, port: LISTEN_PORT, upstream: `${UP_HOST}:${UP_PORT}`,
-                     idle_release_ms: IDLE_RELEASE_MS, max_wait_ms: MAX_WAIT_MS, max_queue: MAX_QUEUE });
+                     idle_release_ms: IDLE_RELEASE_MS, max_wait_ms: MAX_WAIT_MS, max_queue: MAX_QUEUE,
+                     max_snapshot_bytes: MAX_SNAPSHOT_BYTES || 'off',
+                     auth: 'oauth2.1 + static bearer', secrets_dir: auth.CONF_DIR });
 });
 
 for (const sig of ['SIGINT', 'SIGTERM']) {

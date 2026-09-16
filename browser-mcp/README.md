@@ -4,8 +4,10 @@ General-purpose browser automation on a spare Android phone, exposed to AI agent
 over MCP: a real Chromium, driven remotely, with a **queue** in front of it so
 concurrent agents wait their turn instead of failing.
 
-Status: **working slice, LAN-only.** No authentication and no tunnel yet — that is
-Phase 2. Do not expose port 8930 publicly as it stands.
+Status: **auth implemented and unit-tested; tunnel not yet wired.** The gateway is now its
+own OAuth 2.1 authority (see *Authentication* below) and refuses every unauthenticated
+request that arrives through a tunnel, `/status` included. The Cloudflare ingress rule and
+a live end-to-end test on the phone are still outstanding — see *Deploying the tunnel*.
 
 ---
 
@@ -95,6 +97,77 @@ process count.
 | `GW_MAX_WAIT_MS` | 300000 | how long a queued call waits before erroring |
 | `GW_MAX_QUEUE` | 8 | waiters before shedding |
 
+## Authentication
+
+The gateway is its own OAuth 2.1 authorization server (`auth.js`), a direct port of the
+scheme already proven on this phone by `youtube-transcript-mcp/server.py`. Cloudflare Access
+is deliberately **not** used: its DCR endpoint 404s, and claude.ai web is broken against CF
+Managed OAuth.
+
+Two ways in:
+
+| Client | Method |
+|---|---|
+| claude.ai web, any MCP client that does OAuth | RFC 7591 dynamic registration → PKCE S256 → **owner-password consent page** |
+| Claude Code, curl, scripts | Static bearer in `Authorization: Bearer <token>` |
+
+Secrets are generated on first run and persisted `0600` in `~/.config/browser-mcp/`
+(`oauth_secret`, `password`, `bearer_token`). They are **never** in this repo. Because the
+signing key is persisted, tokens survive a gateway restart — you authorize once.
+
+Access tokens last 24 h, refresh tokens 90 d. Authorization codes are single-use and expire
+in 10 minutes.
+
+**The owner password is the entire perimeter** once the tunnel is public — the consent page
+grants full control of a real browser holding your logged-in sessions. Treat it accordingly.
+
+### What is *not* behind auth
+
+Only the OAuth discovery, registration, consent and token endpoints — a client cannot
+present a token before it has one. Everything else, `/status` and `/mcp` alike, requires a
+valid bearer.
+
+On-device callers over plain loopback (`soak.sh`, `start.sh`) are exempt, since they cannot
+be reached from outside. Tunnelled requests also arrive from `127.0.0.1`, so the exemption
+keys off the *absence* of cloudflared's forwarding headers, not the socket address alone.
+
+### Verified locally
+
+Registration, consent, PKCE exchange, refresh, and static bearer all pass; so do the
+negative cases — wrong password, wrong PKCE verifier, `redirect_uri` mismatch, unregistered
+`redirect_uri`, authorization-code replay, and a forged token. **Not yet tested against the
+live phone or through the tunnel.**
+
+## Deploying the tunnel
+
+Not yet done. `BROWSER_MCP_PUBLIC_URL` **must** be set when exposing this, so OAuth metadata
+advertises a fixed origin rather than trusting the `Host` header:
+
+```sh
+BROWSER_MCP_PUBLIC_URL=https://browser.example.org ./start.sh restart
+```
+
+Then add an ingress rule to the phone's existing named tunnel (`~/.cloudflared/config.yml`),
+alongside the yt-mcp one, and create the DNS record. `@playwright/mcp` rejects requests whose
+`Host` is not what it bound to — the gateway already rewrites `Host` when proxying upstream,
+so that is handled, but re-check it after the first live request.
+
+## Snapshot cost
+
+`browser_snapshot` on a large page is very expensive. Measured on this device:
+
+| Tool | Wikipedia "Android" | ≈ tokens |
+|---|---:|---:|
+| `browser_snapshot` | 1,302,514 B | ~326,000 |
+| `browser_find` (`text="Linux kernel"`, 29 matches) | 23,586 B | ~5,900 |
+| `browser_evaluate` (targeted extract) | 599 B | ~150 |
+
+Worse, an agent loop re-sends that snapshot every turn. Prefer `browser_find` to locate an
+element and get its `ref`, and `browser_evaluate` to pull specific text; reserve
+`browser_snapshot` for small pages. Sizes are logged on every call
+(`{"evt":"snapshot_size"}`); set `GW_MAX_SNAPSHOT_BYTES` to refuse oversized ones with a
+message pointing at the cheaper tools.
+
 ## Logging in by hand
 
 The browser runs on a real X display, so you can drive it yourself and leave the
@@ -160,9 +233,12 @@ Cost of headed: cold start 730ms vs 519ms. Worth it.
 
 ```
 gateway.js            the queue / status / logging front-end
+auth.js               OAuth 2.1 authority + static bearer (see Authentication)
 start.sh              brings the stack up in order
 test-concurrency.sh   fires N simultaneous clients, shows they serialize
-soak.sh               unattended endurance test (page load every 30 min)
+soak.sh               unattended endurance test, with guard rails (see below)
+probes.sh             corner-case probes: concurrency, shed, badurl, slowpage, abandon
+report.sh             turns a soak run into a verdict
 bench.mjs             cold start, navigation, memory, profile persistence
 display-bench.mjs     headless vs headed fingerprint and gatekeeper comparison
 ```
