@@ -541,6 +541,10 @@ loadSessions();
 // Adopt start.sh's upstream only if it actually exists. When GW_NO_STATIC_UPSTREAM=1
 // nothing is listening, and `default` becomes an ordinary on-demand profile -- which is
 // what makes GW_MAX_LIVE_PROFILES enforceable.
+// Clear out upstreams orphaned by a previous gateway process before deciding what is
+// live -- otherwise we spawn duplicates onto directories they still hold.
+profiles.reapOrphans();
+
 upReachable().then((live) => {
   if (live) profiles.adoptStatic(UP_PORT, process.env.PROFILE || null);
   else log('no_static_upstream', { port: UP_PORT, note: 'default will be spawned on demand' });

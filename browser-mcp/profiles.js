@@ -95,6 +95,43 @@ async function allocPort() {
 }
 
 /**
+ * Kill upstreams left behind by a previous gateway process.
+ *
+ * Spawned upstreams are detached and unref'd so they survive the gateway, but the map
+ * that tracks them is in memory only. After a gateway restart those processes are still
+ * running and still holding their --user-data-dir, while the new gateway believes nothing
+ * is live -- so it spawns a second server onto the same profile directory, which
+ * @playwright/mcp explicitly forbids. Observed 2026-09-18: three upstreams alive, two of
+ * them on `default`.
+ *
+ * Only processes whose --user-data-dir sits under our PROFILES_DIR are touched, so the
+ * static upstream from start.sh and anything unrelated are left alone.
+ */
+function reapOrphans() {
+  let killed = 0;
+  let pids = [];
+  try { pids = fs.readdirSync('/proc').filter((d) => /^\d+$/.test(d)); } catch { return 0; }
+  for (const pid of pids) {
+    if (Number(pid) === process.pid) continue;
+    let cmd;
+    try { cmd = fs.readFileSync(`/proc/${pid}/cmdline`).toString().split('\0').join(' '); }
+    catch { continue; }
+    if (!cmd.includes('playwright') || !cmd.includes('--user-data-dir')) continue;
+    const m = /--user-data-dir\s+(\S+)/.exec(cmd);
+    if (!m) continue;
+    const dir = path.resolve(m[1]);
+    if (!dir.startsWith(path.resolve(PROFILES_DIR) + path.sep)) continue;
+    try {
+      process.kill(Number(pid), 'SIGTERM');
+      log('orphan_upstream_reaped', { pid: Number(pid), profile: path.basename(dir) });
+      killed++;
+    } catch { /* already gone */ }
+  }
+  if (killed) log('orphans_reaped', { count: killed });
+  return killed;
+}
+
+/**
  * Adopt the upstream that start.sh already launched, so the default profile does not
  * get a second browser spawned on top of it. Called once at gateway startup.
  */
@@ -247,5 +284,6 @@ async function stopAll() { await Promise.all([...live.keys()].map(stop)); }
 module.exports = {
   DEFAULT_PROFILE, PROFILES_DIR, MAX_LIVE,
   routeOf, ensure, stop, stopAll, touch, known, status, adoptStatic, isValidName,
+  reapOrphans,
   pin, unpin,
 };
