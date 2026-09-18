@@ -349,6 +349,47 @@ const server = http.createServer(async (req, res) => {
     return res.end(payload);
   }
 
+  // ---- profile management (#5 hand-login). Authenticated like everything else.
+  //   GET  /profiles              list known + live profiles
+  //   POST /profiles/<name>/pin   spawn it and hold it open for a hand-login
+  //   POST /profiles/<name>/unpin release it back to normal idle teardown
+  {
+    const mgmt = /^\/profiles(?:\/([^/]+)\/(pin|unpin))?\/?$/.exec(req.url.split('?')[0]);
+    if (mgmt) {
+      if (req.method === 'GET' && !mgmt[1]) {
+        const payload = JSON.stringify(profiles.status(), null, 2);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        return res.end(payload);
+      }
+      if (req.method === 'POST' && mgmt[1]) {
+        const name = decodeURIComponent(mgmt[1]);
+        if (!profiles.isValidName(name)) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          return res.end(JSON.stringify({ error: `invalid profile name "${name}"` }));
+        }
+        try {
+          if (mgmt[2] === 'pin') {
+            const u = await profiles.pin(name);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({
+              profile: name, port: u.port, pinned: true,
+              note: 'Browser is open on the X display and will not be torn down. Unpin when done.',
+            }, null, 2));
+          }
+          const had = profiles.unpin(name);
+          res.writeHead(200, { 'content-type': 'application/json' });
+          return res.end(JSON.stringify({ profile: name, pinned: false, was_pinned: had }, null, 2));
+        } catch (e) {
+          log('profile_mgmt_failed', { profile: name, op: mgmt[2], err: e.message });
+          res.writeHead(500, { 'content-type': 'application/json' });
+          return res.end(JSON.stringify({ error: e.message }));
+        }
+      }
+      res.writeHead(405, { 'content-type': 'application/json' });
+      return res.end('{"error":"method not allowed"}');
+    }
+  }
+
   // Named profiles (#5). /mcp is the default profile; /mcp/<name> selects another,
   // each backed by its own upstream with its own --user-data-dir, so cookies and
   // logins are isolated and survive restarts.

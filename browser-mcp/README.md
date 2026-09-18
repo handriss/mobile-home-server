@@ -251,9 +251,37 @@ rather than spawning a second browser onto the same directory.
 
 ### Logging into a profile by hand
 
-VNC to the display, drive the browser yourself, and the session lands in that profile's
-directory. See below — but note the VNC display currently shows the **default** profile's
-browser. Attaching a hand-login flow to an arbitrary named profile is not wired yet.
+```sh
+./login.sh --list                       # what profiles exist, which are live
+./login.sh work https://example.com/    # open 'work' and hold it while you sign in
+./login.sh work --check https://site/   # what is this profile signed into there?
+```
+
+`login.sh` handles the two things that make a hand-login work, which are **not** the same
+thing:
+
+1. the profile's **upstream** must stay alive — `/profiles/<name>/pin`;
+2. an **MCP session** must stay open — the browser window belongs to the session, not the
+   server, so closing the session closes Chromium. The gateway also reclaims a session that
+   goes quiet for `GW_IDLE_RELEASE_MS`, which would shut the window mid-login, so `login.sh`
+   heartbeats it.
+
+Every profile's Chromium is headed on the same Xvnc display, so one VNC connection reaches
+all of them; `login.sh` renames the relevant window to `PROFILE: <name>` and raises it so
+you can tell several apart. Credentials go straight into that profile's Chromium — never
+through an agent, this script, or the gateway.
+
+Management endpoints (authenticated like everything else):
+
+| Route | Does |
+|---|---|
+| `GET /profiles` | known + live profiles, which are pinned |
+| `POST /profiles/<name>/pin` | start it and hold it open |
+| `POST /profiles/<name>/unpin` | release it to normal idle teardown |
+
+> A pinned profile is exempt from both idle teardown and LRU eviction, so pinning can push
+> the live count above `GW_MAX_LIVE_PROFILES`. That is deliberate — a pin is a human
+> sitting at the screen — but it does mean an abandoned pin holds a browser open.
 
 ## Logging in by hand
 
@@ -324,6 +352,7 @@ auth.js               OAuth 2.1 authority + static bearer (see Authentication)
 profiles.js           per-profile upstream pool: spawn, adopt, evict, idle teardown
 start.sh              brings the stack up in order
 test-concurrency.sh   fires N simultaneous clients, shows they serialize
+login.sh              hand-login into a named profile (#5)
 soak.sh               unattended endurance test, with guard rails (see below)
 probes.sh             corner-case probes: concurrency, shed, badurl, slowpage, abandon
 report.sh             turns a soak run into a verdict

@@ -50,6 +50,9 @@ const log = (evt, fields = {}) =>
 
 /** name -> { name, port, proc, dir, lastUsed, startedAt, static } */
 const live = new Map();
+// Profiles pinned open by a human. A pinned profile is never idle-reaped and never
+// evicted, so a hand-login session cannot be torn down mid-typing (#5).
+const pinned = new Set();
 let nextPort = PORT_BASE;
 
 function isValidName(n) { return typeof n === 'string' && VALID_NAME.test(n); }
@@ -106,7 +109,7 @@ function adoptStatic(port, dir) {
 /** Stop the least-recently-used non-static profile to stay under MAX_LIVE. */
 async function evictIfNeeded(keep) {
   const candidates = [...live.values()]
-    .filter((u) => !u.static && u.name !== keep)
+    .filter((u) => !u.static && u.name !== keep && !pinned.has(u.name))
     .sort((a, b) => a.lastUsed - b.lastUsed);
   while (live.size >= MAX_LIVE && candidates.length) {
     const victim = candidates.shift();
@@ -189,6 +192,20 @@ async function stop(name) {
 
 function touch(name) { const u = live.get(name); if (u) u.lastUsed = Date.now(); }
 
+/** Hold a profile's browser open for a hand-login. Returns the upstream. */
+async function pin(name) {
+  const u = await ensure(name);
+  pinned.add(name);
+  log('profile_pinned', { profile: name, port: u.port });
+  return u;
+}
+function unpin(name) {
+  const had = pinned.delete(name);
+  if (had) log('profile_unpinned', { profile: name });
+  touch(name);                       // restart the idle clock from now
+  return had;
+}
+
 /** Profiles that exist on disk, whether or not a browser is currently running. */
 function known() {
   try {
@@ -204,8 +221,9 @@ function status() {
     known: known(),
     max_live: MAX_LIVE,
     idle_teardown_ms: IDLE_MS,
+    pinned: [...pinned],
     live: [...live.values()].map((u) => ({
-      profile: u.name, port: u.port, static: !!u.static,
+      profile: u.name, port: u.port, static: !!u.static, pinned: pinned.has(u.name),
       up_s: Math.round((Date.now() - u.startedAt) / 1000),
       idle_s: Math.round((Date.now() - u.lastUsed) / 1000),
     })),
@@ -215,7 +233,7 @@ function status() {
 // Idle teardown. Never reaps the static upstream — start.sh owns that one.
 const sweeper = setInterval(() => {
   for (const u of [...live.values()]) {
-    if (u.static) continue;
+    if (u.static || pinned.has(u.name)) continue;
     if (Date.now() - u.lastUsed > IDLE_MS) {
       log('profile_idle_teardown', { profile: u.name, idle_s: Math.round((Date.now() - u.lastUsed) / 1000) });
       stop(u.name);
@@ -229,4 +247,5 @@ async function stopAll() { await Promise.all([...live.keys()].map(stop)); }
 module.exports = {
   DEFAULT_PROFILE, PROFILES_DIR, MAX_LIVE,
   routeOf, ensure, stop, stopAll, touch, known, status, adoptStatic, isValidName,
+  pin, unpin,
 };
