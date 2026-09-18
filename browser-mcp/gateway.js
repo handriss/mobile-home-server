@@ -538,7 +538,13 @@ const server = http.createServer(async (req, res) => {
 loadSessions();
 // start.sh launches one upstream itself; adopt it as the default profile so we never
 // spawn a second browser onto the same --user-data-dir.
-profiles.adoptStatic(UP_PORT, process.env.PROFILE || null);
+// Adopt start.sh's upstream only if it actually exists. When GW_NO_STATIC_UPSTREAM=1
+// nothing is listening, and `default` becomes an ordinary on-demand profile -- which is
+// what makes GW_MAX_LIVE_PROFILES enforceable.
+upReachable().then((live) => {
+  if (live) profiles.adoptStatic(UP_PORT, process.env.PROFILE || null);
+  else log('no_static_upstream', { port: UP_PORT, note: 'default will be spawned on demand' });
+});
 
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
   log('listening', { host: LISTEN_HOST, port: LISTEN_PORT, upstream: `${UP_HOST}:${UP_PORT}`,

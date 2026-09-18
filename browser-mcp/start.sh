@@ -37,8 +37,22 @@ start_all() {
   if ! up "Xvnc :$DISPLAY_NUM"; then
     echo ">> Xvnc on :$DISPLAY_NUM ($GEOMETRY)"
     # -localhost: the VNC port never leaves the device. Reach it with an SSH tunnel.
+    #
+    # VncAuth rather than SecurityTypes None: macOS Screen Sharing refuses "None" and
+    # prompts for a password it can never accept. The password file is generated once,
+    # 0600, and never leaves the device -- read it with:
+    #     ssh -p 8022 <phone> 'cat ~/.config/browser-mcp/vncpass.txt'
+    if [ ! -f "$HOME/.vnc/passwd" ]; then
+      mkdir -p "$HOME/.vnc" "$HOME/.config/browser-mcp"
+      VNCPW="$(head -c 9 /dev/urandom | base64 | tr -d "=+/" | cut -c1-8)"
+      printf '%s\n' "$VNCPW" > "$HOME/.config/browser-mcp/vncpass.txt"
+      chmod 600 "$HOME/.config/browser-mcp/vncpass.txt"
+      printf '%s\n%s\n' "$VNCPW" "$VNCPW" | vncpasswd -f > "$HOME/.vnc/passwd" 2>/dev/null
+      chmod 600 "$HOME/.vnc/passwd"
+      echo ">> generated a VNC password (see ~/.config/browser-mcp/vncpass.txt)"
+    fi
     setsid Xvnc ":$DISPLAY_NUM" -geometry "$GEOMETRY" -depth 24 \
-      -SecurityTypes None -localhost -AlwaysShared \
+      -SecurityTypes VncAuth -PasswordFile "$HOME/.vnc/passwd" -localhost -AlwaysShared \
       >> "$LAB/xvnc.log" 2>&1 < /dev/null &
     sleep 5
   fi
@@ -49,7 +63,12 @@ start_all() {
     sleep 2
   fi
 
-  if ! up '@playwright/mcp'; then
+  # With GW_NO_STATIC_UPSTREAM=1 no browser is started here at all; the gateway spawns
+  # whichever profile is actually asked for. That makes GW_MAX_LIVE_PROFILES a real limit
+  # -- an adopted static upstream is exempt from eviction, so with one running you always
+  # get a second browser the moment any named profile is used. Two concurrent Chromiums is
+  # the condition present at every process-shedding incident on this device.
+  if [ "${GW_NO_STATIC_UPSTREAM:-0}" != "1" ] && ! up '@playwright/mcp'; then
     echo ">> @playwright/mcp (headed, profile: $PROFILE)"
     cd "$LAB" || exit 1
     setsid node --require "$LAB/shim.cjs" "$LAB/node_modules/@playwright/mcp/cli.js" \
@@ -89,7 +108,8 @@ stop_all() {
 status_all() {
   printf '%-14s %s\n' "Xvnc"     "$(up "Xvnc :$DISPLAY_NUM" && echo "up (:$DISPLAY_NUM $GEOMETRY)" || echo down)"
   printf '%-14s %s\n' "openbox"  "$(up openbox && echo up || echo down)"
-  printf '%-14s %s\n' "mcp"      "$(up '@playwright/mcp' && echo "up (:$MCP_PORT)" || echo down)"
+  printf '%-14s %s\n' "mcp"      "$(up '@playwright/mcp' && echo "up (:$MCP_PORT)" || \
+    { [ "${GW_NO_STATIC_UPSTREAM:-0}" = "1" ] && echo "on demand (no static upstream)" || echo down; })"
   printf '%-14s %s\n' "gateway"  "$(up 'gateway.js' && echo "up (:$GW_PORT)" || echo down)"
   printf '%-14s %s\n' "chromium" "$(pgrep -fc 'lib/chromium/chrome' 2>/dev/null || echo 0) processes"
   echo "--- gateway status ---"
