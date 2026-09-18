@@ -153,6 +153,51 @@ alongside the yt-mcp one, and create the DNS record. `@playwright/mcp` rejects r
 `Host` is not what it bound to — the gateway already rewrites `Host` when proxying upstream,
 so that is handled, but re-check it after the first live request.
 
+## Recovery: two tiers, and why the inner one is not enough
+
+`supervise.sh` polls every 15 s and restarts what is missing. It is fast, and it is also
+an ordinary Termux process — so it dies in exactly the events it exists to recover from.
+That happened twice (2026-09-16, 2026-09-18), each time taking sshd recovery with it and
+leaving the device unreachable until something outside Termux intervened.
+
+That something is **Android's JobScheduler**, via `termux-job-scheduler --persisted true`.
+Android relaunches Termux to run the job even after killing it, so a job registered there
+survives anything that happens inside Termux. The Forgejo project on this phone already
+used it (`~/forgejo/schedule-watchdog.sh`, job 4272, 15-minute period — Android's minimum),
+and that job rescued the device every single time.
+
+The browser stack is now registered with the same job:
+
+| Tier | Mechanism | Period | Survives a Termux-wide kill? |
+|---|---|---|---|
+| Fast | `supervise.sh` | 15 s | **No** |
+| Outer | `~/forgejo/watchdog.sh` via JobScheduler | 15 min | **Yes** |
+
+The outer tier restarts the browser stack *and* `supervise.sh` itself. Verified: killing the
+supervisor, the gateway and Xvnc, then running the watchdog, produced
+`watchdog restarted: browser-stack browser-supervisor` and a gateway answering again.
+
+So worst case you are down for up to 15 minutes rather than until someone picks the phone
+up. If you need faster, the fast tier is what provides it — when it is alive.
+
+## One browser at a time
+
+`GW_NO_STATIC_UPSTREAM=1` stops `start.sh` launching an always-on default browser; the
+gateway spawns whichever profile is asked for. This is what makes `GW_MAX_LIVE_PROFILES=1`
+an enforceable limit — an *adopted static* upstream is exempt from eviction, so with one
+running you always got a second browser the moment any named profile was used.
+
+**Every process-shedding incident on this device had two or more concurrent Chromiums.**
+Four for four. Not proof, but it is the only condition common to all of them, and the
+mitigation is cheap.
+
+> This also settles **per-profile locking**: with one browser there is nothing to unlock in
+> parallel. Building it would mean deliberately running the configuration that breaks this
+> device. Deferred on purpose, not forgotten.
+
+At idle the healthy state is now **no browser and no upstream at all** — `soak.sh` therefore
+measures liveness by asking the gateway, not by looking for a `@playwright/mcp` process.
+
 ## Co-tenancy: what else lives on this phone
 
 This is not a dedicated device. nginx (:8080), yt-transcript-MCP (:8765), Forgejo (:3000),

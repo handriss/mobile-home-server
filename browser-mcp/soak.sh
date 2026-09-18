@@ -105,7 +105,10 @@ except Exception: print(',,,,,,,')
 " 2>/dev/null || echo ",,,,,,,"
 }
 
-stack_up() { pgrep -f '@playwright/mcp' >/dev/null 2>&1 && pgrep -f 'gateway.js' >/dev/null 2>&1; }
+# Liveness = the gateway answers. Checking for a running @playwright/mcp process is wrong
+# now that profiles are spawned on demand (GW_NO_STATIC_UPSTREAM=1): at idle there is no
+# upstream and no browser, which is the healthy state, not a failure.
+stack_up() { timeout 8 curl -s -o /dev/null "http://127.0.0.1:$PORT/status" 2>/dev/null; }
 
 # ---- guard evaluation -------------------------------------------------------
 NEIGHBOUR_STREAK=0
