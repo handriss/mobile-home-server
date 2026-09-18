@@ -12,7 +12,7 @@
 # minutes, which is a poor experience mid-login. This pins it open, tells you how to
 # connect, and unpins when you are done.
 #
-#   login.sh <profile>          pin, print instructions, wait for you, then unpin
+#   login.sh <profile> [url]    open it, hold it while you sign in, then release
 #   login.sh <profile> --check [url]   what this profile is signed into on <url>
 #   login.sh --list             show profiles and which are pinned
 #
@@ -48,13 +48,25 @@ print(f\"  default profile: {d['default']}   max live: {d['max_live']}\")
 esac
 
 PROFILE="$1"
-MODE="${2:-login}"
+# Accept either form, because "login.sh <profile> <url>" is the obvious way to call this
+# and used to land the URL in the mode slot:
+#     login.sh work https://site/          -> mode=login, url=https://site/
+#     login.sh work --check https://site/  -> mode=--check, url=https://site/
+#     login.sh work login https://site/    -> explicit, still works
+case "${2:-}" in
+  "")            MODE="login";      ARG_URL="" ;;
+  --check)       MODE="--check";    ARG_URL="${3:-}" ;;
+  login)         MODE="login";      ARG_URL="${3:-}" ;;
+  http://*|https://*|about:*)
+                 MODE="login";      ARG_URL="$2" ;;
+  *)             echo "unknown option '''$2''' -- expected a URL, 'login', or '--check'"; exit 1 ;;
+esac
 
 if [ "$MODE" = "--check" ]; then
   # document.cookie is origin-scoped and throws on about:blank, so we must land on the
   # site being asked about. Default to example.com purely to prove the profile opens;
   # pass the real site to see whether you are still signed in to it.
-  CHECK_URL="${3:-https://example.com/}"
+  CHECK_URL="${ARG_URL:-https://example.com/}"
   echo "Bringing up '$PROFILE' and loading $CHECK_URL ..."
   api -X POST "$B/profiles/$PROFILE/pin" >/dev/null
   sid=$(curl -s -m 40 -D - -o /dev/null -X POST "$B/mcp/$PROFILE" \
@@ -91,7 +103,7 @@ fi
 #      session, not the server. Closing the session closes Chromium. And the gateway
 #      reclaims a session that goes quiet for GW_IDLE_RELEASE_MS, which would shut the
 #      window while you were still typing -- so we heartbeat it.
-START_URL="${3:-about:blank}"
+START_URL="${ARG_URL:-about:blank}"
 
 echo "Opening a browser for profile '$PROFILE'..."
 resp="$(api -X POST "$B/profiles/$PROFILE/pin")"
