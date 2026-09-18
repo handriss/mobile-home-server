@@ -23,6 +23,12 @@ export TMPDIR="$HOME/tmp"
 
 mkdir -p "$LAB" "$TMPDIR" "$PROFILE"
 
+# Local, untracked config: the real public hostname and any secrets-adjacent settings live
+# here, not in this repo. Sourced so the supervisor's restarts inherit them too -- without
+# this, an auto-restart would drop BROWSER_MCP_PUBLIC_URL and the OAuth metadata would fall
+# back to trusting the Host header.
+[ -f "$LAB/gateway.env" ] && . "$LAB/gateway.env"
+
 up(){ pgrep -f "$1" >/dev/null 2>&1; }
 
 start_all() {

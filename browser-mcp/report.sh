@@ -117,11 +117,22 @@ if aborted:
 
 # --- probes
 if os.path.exists(prb_path):
+    # Only probes inside THIS soak's window. probes.jsonl is append-only across runs, so
+    # without this filter a previous run's failures reappear in every future report --
+    # which is exactly what happened on 2026-09-17, showing two stale FAILs against a
+    # run during which no probes executed at all.
+    t_lo, t_hi = rows[0]["ts"], rows[-1]["ts"]
     probes = {}
+    skipped = 0
     for line in open(prb_path):
         try: p = json.loads(line)
         except Exception: continue
+        if not (t_lo <= p.get("ts", "") <= t_hi):
+            skipped += 1
+            continue
         probes.setdefault(p["probe"], []).append(p)
+    if skipped:
+        print(f"\n({skipped} probe record(s) from earlier runs excluded)")
     if probes:
         print("\ncorner-case probes:")
         for name, runs in sorted(probes.items()):

@@ -142,10 +142,10 @@ live phone or through the tunnel.**
 
 Not yet done. `BROWSER_MCP_PUBLIC_URL` **must** be set when exposing this, so OAuth metadata
 advertises a fixed origin rather than trusting the `Host` header. The chosen hostname is
-**`browser.quietharbors.org`**:
+**`browser.example.com`**:
 
 ```sh
-BROWSER_MCP_PUBLIC_URL=https://browser.quietharbors.org ./start.sh restart
+BROWSER_MCP_PUBLIC_URL=https://browser.example.com ./start.sh restart
 ```
 
 Then add an ingress rule to the phone's existing named tunnel (`~/.cloudflared/config.yml`),
@@ -217,9 +217,9 @@ message pointing at the cheaper tools.
 down after `GW_PROFILE_IDLE_MS` of silence.
 
 ```
-https://browser.quietharbors.org/mcp            -> profile "default"
-https://browser.quietharbors.org/mcp/work       -> profile "work"
-https://browser.quietharbors.org/mcp/personal   -> profile "personal"
+https://browser.example.com/mcp            -> profile "default"
+https://browser.example.com/mcp/work       -> profile "work"
+https://browser.example.com/mcp/personal   -> profile "personal"
 ```
 
 Point each agent at the URL for the profile it should use. Names are `[a-z0-9_-]`, max 32
