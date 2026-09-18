@@ -7,3 +7,11 @@ __pycache__/
 
 # Agent working notes — internal, not for publication
 CLAUDE.md
+
+# Playwright MCP writes page snapshots relative to its working directory
+.playwright-mcp/
+
+# Runtime data and local config that must never be committed
+browser-mcp/node_modules/
+gateway.env
+*.log
