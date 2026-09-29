@@ -57,6 +57,18 @@ let nextPort = PORT_BASE;
 
 function isValidName(n) { return typeof n === 'string' && VALID_NAME.test(n); }
 
+// In-flight requests per profile. ensure() can hand back an upstream that a concurrent
+// ensure() for another profile then evicts under MAX_LIVE, before the first request is
+// even proxied -- the caller sees "Server not initialized" from a corpse. A hold makes
+// eviction wait for the request instead of racing it.
+const holds = new Map();
+function hold(name) { holds.set(name, (holds.get(name) || 0) + 1); }
+function unhold(name) {
+  const n = (holds.get(name) || 0) - 1;
+  if (n > 0) holds.set(name, n); else holds.delete(name);
+}
+const isHeld = (name) => (holds.get(name) || 0) > 0;
+
 /**
  * Split a request path into { profile, upstreamPath }.
  *   /mcp            -> { default,  /mcp }
@@ -143,6 +155,8 @@ function adoptStatic(port, dir) {
   log('profile_adopted', { profile: DEFAULT_PROFILE, port, dir, managed_by: 'start.sh' });
 }
 
+const EVICT_WAIT_MS = Number(process.env.GW_EVICT_WAIT_MS || 15_000);
+
 /** Stop the least-recently-used non-static profile to stay under MAX_LIVE. */
 async function evictIfNeeded(keep) {
   const candidates = [...live.values()]
@@ -150,9 +164,22 @@ async function evictIfNeeded(keep) {
     .sort((a, b) => a.lastUsed - b.lastUsed);
   while (live.size >= MAX_LIVE && candidates.length) {
     const victim = candidates.shift();
+    // Let whatever is mid-request on the victim finish rather than pulling the upstream
+    // out from under it. Bounded: a stuck request must not block the whole pool forever.
+    const until = Date.now() + EVICT_WAIT_MS;
+    while (isHeld(victim.name) && Date.now() < until) await new Promise((r) => setTimeout(r, 100));
+    if (isHeld(victim.name)) {
+      log('evict_skipped_busy', { profile: victim.name, waited_ms: EVICT_WAIT_MS });
+      continue;
+    }
     log('profile_evicted', { profile: victim.name, idle_s: Math.round((Date.now() - victim.lastUsed) / 1000),
                              reason: 'max_live_profiles' });
     await stop(victim.name);
+  }
+  // Exceeding MAX_LIVE is the failure mode this device sheds processes over, so refuse
+  // instead. Holds are held only around a single proxied request, so this is rare.
+  if (live.size >= MAX_LIVE) {
+    throw new Error(`all ${MAX_LIVE} browser slot(s) are busy (${[...live.keys()].join(', ')}); retry shortly`);
   }
 }
 
@@ -180,14 +207,23 @@ function spawnUpstream(name, port, dir) {
 /**
  * Ensure profile `name` has a live upstream; return it. Concurrent callers share one
  * in-flight spawn rather than racing two browsers onto the same --user-data-dir.
+ *
+ * Spawns are serialized across *all* names, not just deduped per name. evictIfNeeded()
+ * reads live.size, but a profile only enters `live` once its port answers -- so two
+ * concurrent ensures for different profiles both saw room under MAX_LIVE and both
+ * started a browser. That is the two-concurrent-Chromium state this device sheds
+ * processes over; it happened every time a client had two profiles configured at once.
  */
 const pending = new Map();
+let spawnChain = Promise.resolve();
 function ensure(name) {
   const existing = live.get(name);
   if (existing) { existing.lastUsed = Date.now(); return Promise.resolve(existing); }
   if (pending.has(name)) return pending.get(name);
 
-  const p = (async () => {
+  const p = spawnChain.then(async () => {
+    const won = live.get(name);
+    if (won) { won.lastUsed = Date.now(); return won; }
     await evictIfNeeded(name);
     const dir = path.join(PROFILES_DIR, name);
     const port = await allocPort();
@@ -199,6 +235,15 @@ function ensure(name) {
       if (await portListening(port)) {
         const u = { name, port, proc, dir, static: false, lastUsed: Date.now(), startedAt: Date.now() };
         live.set(name, u);
+        // A crashed or externally-killed upstream must leave the pool, or ensure() keeps
+        // handing out a dead port and every caller gets a connection error instead of a
+        // fresh browser.
+        proc.once('exit', (code, sig) => {
+          if (live.get(name) !== u) return;          // already replaced by stop()
+          live.delete(name);
+          log('profile_died', { profile: name, port, code, sig });
+          try { onStop(name, port); } catch { /* best effort */ }
+        });
         log('profile_ready', { profile: name, port, ms: Date.now() - (deadline - SPAWN_TIMEOUT_MS) });
         return u;
       }
@@ -209,11 +254,19 @@ function ensure(name) {
     }
     try { process.kill(-proc.pid, 'SIGKILL'); } catch { /* already gone */ }
     throw new Error(`profile "${name}" upstream did not start within ${SPAWN_TIMEOUT_MS / 1000}s`);
-  })().finally(() => pending.delete(name));
+  }).finally(() => pending.delete(name));
 
+  // A failed spawn must not poison the chain for everyone behind it.
+  spawnChain = p.then(() => {}, () => {});
   pending.set(name, p);
   return p;
 }
+
+// Called with (profile, port) whenever an upstream is torn down. The gateway uses it to
+// forget MCP sessions that lived on that port -- proxying to a dead upstream, or holding
+// the browser lock on behalf of a session whose browser is gone, wedges the next caller.
+let onStop = () => {};
+function setOnStop(fn) { onStop = fn; }
 
 async function stop(name) {
   const u = live.get(name);
@@ -224,6 +277,7 @@ async function stop(name) {
   await new Promise((r) => setTimeout(r, 1200));
   try { process.kill(-u.proc.pid, 'SIGKILL'); } catch { /* gone */ }
   log('profile_stopped', { profile: name, port: u.port });
+  try { onStop(name, u.port); } catch (e) { log('on_stop_failed', { profile: name, err: e.message }); }
   return true;
 }
 
@@ -281,9 +335,12 @@ sweeper.unref();
 
 async function stopAll() { await Promise.all([...live.keys()].map(stop)); }
 
+/** Ports of every currently live upstream. */
+function livePorts() { return [...live.values()].map((u) => u.port); }
+
 module.exports = {
   DEFAULT_PROFILE, PROFILES_DIR, MAX_LIVE,
   routeOf, ensure, stop, stopAll, touch, known, status, adoptStatic, isValidName,
-  reapOrphans,
+  reapOrphans, livePorts, setOnStop, hold, unhold,
   pin, unpin,
 };
