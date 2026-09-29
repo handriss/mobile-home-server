@@ -108,10 +108,15 @@ stop_all() {
 status_all() {
   printf '%-14s %s\n' "Xvnc"     "$(up "Xvnc :$DISPLAY_NUM" && echo "up (:$DISPLAY_NUM $GEOMETRY)" || echo down)"
   printf '%-14s %s\n' "openbox"  "$(up openbox && echo up || echo down)"
-  printf '%-14s %s\n' "mcp"      "$(up '@playwright/mcp' && echo "up (:$MCP_PORT)" || \
+  # Report the ports upstreams are actually on. Matching '@playwright/mcp' and then printing
+  # $MCP_PORT claimed ":8931" while the only upstream was an on-demand profile on :8943 --
+  # exactly the kind of pattern-match misreading that has cost hours on this device.
+  mcp_ports=$(ps -ef | grep '[@]playwright/mcp' | grep -oE '[-]-port [0-9]+' | awk '{print $2}' | sort -u | tr '\n' ' ')
+  printf '%-14s %s\n' "mcp"      "$([ -n "$mcp_ports" ] && echo "up (:${mcp_ports% })" || \
     { [ "${GW_NO_STATIC_UPSTREAM:-0}" = "1" ] && echo "on demand (no static upstream)" || echo down; })"
   printf '%-14s %s\n' "gateway"  "$(up 'gateway.js' && echo "up (:$GW_PORT)" || echo down)"
-  printf '%-14s %s\n' "chromium" "$(pgrep -fc 'lib/chromium/chrome' 2>/dev/null || echo 0) processes"
+  printf '%-14s %s\n' "supervisor" "$(ps -ef | grep -q '[p]ipeline-supervisor' && echo up || echo down)"
+  printf '%-14s %s\n' "browsers" "$(ps -ef | grep '[c]hromium/chrome' | grep -oE 'user-data-dir=?[^ ]*' | sort -u | wc -l | tr -d ' ') (of max ${GW_MAX_LIVE_PROFILES:-2})"
   echo "--- gateway status ---"
   curl -s -m 5 "http://127.0.0.1:$GW_PORT/status" || echo "(gateway not answering)"
 }
