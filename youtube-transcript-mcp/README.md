@@ -146,3 +146,26 @@ Python **standard library only** + yt-dlp (see `requirements.txt`). The server p
 idles at tens of MB; yt-dlp runs as a short-lived subprocess only on cache misses.
 Fine for the phone. Fronted on-device by `cloudflared` (named tunnel), autostarted by
 Termux:Boot alongside the existing nginx / sshd / battery-monitor services.
+
+## Caption traps (learned the hard way, 2026-09-29)
+
+**"HTTP 429: Too Many Requests" on captions is almost never a quota.** YouTube serves
+`tlang=` (machine-translation) timedtext requests from a path that 429s most of the time,
+while the untranslated track beside it answers every single request. Spacing requests out
+changes nothing — measured: the same track 429s at 0.2s and at 3.0s spacing, and the
+`-orig` track next to it returned 200 six times out of six.
+
+Consequences baked into `server.py`:
+
+- Never request caption tracks with a glob. `--sub-langs "en,en.*"` is a **regex** in yt-dlp
+  and expands to every `en*` track on a video that offers ~200 auto-translations — several
+  HTTP requests per transcript, and the run fails on whichever one is a translation.
+- `_candidates()` sorts untranslated tracks first and falls through them one by one, so a
+  throttled translation never fails the call while a usable track exists.
+- When only a translated track matches the asked-for language, the original-language track
+  is returned instead, with a `NOTE:` in the header saying so. A Korean transcript a model
+  can read beats a dead end.
+
+`ytsearchdate:` is also broken upstream (dead in 2026.07.04 and still in 2026.08.19), so
+`sort="date"` goes through YouTube's own `&sp=CAI%3D` results URL and filters out the
+channel/playlist rows that page mixes in.
