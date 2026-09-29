@@ -97,6 +97,11 @@ start_all() {
 
 stop_all() {
   pkill -f 'gateway.js' 2>/dev/null
+  # Do not return while something still holds :$GW_PORT, or a following `start` sees a live
+  # gateway process, skips launching one, and the tunnel serves 502 with no listener.
+  i=0
+  while [ $i -lt 10 ] && ps -ef | grep -q '[g]ateway.js'; do sleep 1; i=$((i+1)); done
+  pkill -9 -f 'gateway.js' 2>/dev/null
   pkill -f '@playwright/mcp' 2>/dev/null
   sleep 2
   pkill -f 'lib/chromium/chrome' 2>/dev/null
@@ -116,7 +121,10 @@ status_all() {
     { [ "${GW_NO_STATIC_UPSTREAM:-0}" = "1" ] && echo "on demand (no static upstream)" || echo down; })"
   printf '%-14s %s\n' "gateway"  "$(up 'gateway.js' && echo "up (:$GW_PORT)" || echo down)"
   printf '%-14s %s\n' "supervisor" "$(ps -ef | grep -q '[p]ipeline-supervisor' && echo up || echo down)"
-  printf '%-14s %s\n' "browsers" "$(ps -ef | grep '[c]hromium/chrome' | grep -oE 'user-data-dir=?[^ ]*' | sort -u | wc -l | tr -d ' ') (of max ${GW_MAX_LIVE_PROFILES:-2})"
+  # Ask the gateway, which counts distinct --user-data-dir values out of /proc. A ps|grep
+  # here matched this very command line ("user-data-dir=?[^") and always over-reported.
+  printf '%-14s %s\n' "browsers" "$(curl -s -m 5 "http://127.0.0.1:$GW_PORT/status" \
+    | sed -n 's/.*"browsers": *\([0-9]*\).*/\1/p' | head -1 || echo '?') (of max ${GW_MAX_LIVE_PROFILES:-2})"
   echo "--- gateway status ---"
   curl -s -m 5 "http://127.0.0.1:$GW_PORT/status" || echo "(gateway not answering)"
 }

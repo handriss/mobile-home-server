@@ -218,7 +218,18 @@ const pending = new Map();
 let spawnChain = Promise.resolve();
 function ensure(name) {
   const existing = live.get(name);
-  if (existing) { existing.lastUsed = Date.now(); return Promise.resolve(existing); }
+  if (existing) {
+    existing.lastUsed = Date.now();
+    // Trust the map only as far as the port. An upstream can die without its exit event
+    // having landed yet, and handing back a dead port turns into a connection error for
+    // the caller instead of the fresh browser it asked for.
+    return portListening(existing.port).then((ok) => {
+      if (ok) return existing;
+      log('profile_stale_dropped', { profile: name, port: existing.port });
+      if (live.get(name) === existing) live.delete(name);
+      return ensure(name);
+    });
+  }
   if (pending.has(name)) return pending.get(name);
 
   const p = spawnChain.then(async () => {
@@ -268,6 +279,39 @@ function ensure(name) {
 let onStop = () => {};
 function setOnStop(fn) { onStop = fn; }
 
+/** PIDs of Chromium processes holding `dir` as their --user-data-dir. */
+function browserPidsFor(dir) {
+  const out = [];
+  let pids = [];
+  try { pids = fs.readdirSync('/proc').filter((d) => /^\d+$/.test(d)); } catch { return out; }
+  for (const pid of pids) {
+    let argv;
+    try { argv = fs.readFileSync(`/proc/${pid}/cmdline`).toString().split('\0'); } catch { continue; }
+    if (!argv[0] || !argv[0].includes('chromium/chrome')) continue;
+    if (argv.some((a) => a === `--user-data-dir=${dir}` || a === dir)) out.push(Number(pid));
+  }
+  return out;
+}
+
+/**
+ * Wait for a profile's browser to actually be gone. Playwright's Chromium does not always
+ * die with the upstream's process group, so without this the next profile's browser starts
+ * while the previous one is still up -- the two-concurrent-Chromium state that precedes
+ * every process-shedding incident on this device.
+ */
+async function waitBrowserGone(dir, budgetMs = 8000) {
+  const until = Date.now() + budgetMs;
+  while (Date.now() < until) {
+    const pids = browserPidsFor(dir);
+    if (!pids.length) return true;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  const left = browserPidsFor(dir);
+  for (const pid of left) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
+  if (left.length) log('browser_force_killed', { dir, pids: left });
+  return left.length === 0;
+}
+
 async function stop(name) {
   const u = live.get(name);
   if (!u) return false;
@@ -276,6 +320,7 @@ async function stop(name) {
   try { process.kill(-u.proc.pid, 'SIGTERM'); } catch { /* gone */ }
   await new Promise((r) => setTimeout(r, 1200));
   try { process.kill(-u.proc.pid, 'SIGKILL'); } catch { /* gone */ }
+  await waitBrowserGone(u.dir);
   log('profile_stopped', { profile: name, port: u.port });
   try { onStop(name, u.port); } catch (e) { log('on_stop_failed', { profile: name, err: e.message }); }
   return true;

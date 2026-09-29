@@ -94,8 +94,38 @@ process count.
 | `GW_PORT` | 8930 | gateway listen port |
 | `GW_UPSTREAM_PORT` | 8931 | `@playwright/mcp` port |
 | `GW_IDLE_RELEASE_MS` | 120000 | silence before a holder loses the browser |
+| `GW_IDLE_RELEASE_WAITING_MS` | 20000 | shorter grace when someone is queued behind it |
 | `GW_MAX_WAIT_MS` | 300000 | how long a queued call waits before erroring |
 | `GW_MAX_QUEUE` | 8 | waiters before shedding |
+| `GW_KEEP_CLIENT_CAPS` | unset | `1` forwards `roots`/`sampling`/`elicitation` — see below |
+| `GW_EVICT_WAIT_MS` | 15000 | how long eviction waits for an in-flight request |
+
+### Sessions survive their browser
+
+A client's MCP session outlives the upstream it was created on. When a profile is evicted
+under `GW_MAX_LIVE_PROFILES`, torn down when idle, or simply crashes, the gateway keeps the
+client's session record (including the `initialize` body) and re-establishes it upstream on
+the next call, under the client's original session id. The client never sees the change.
+
+That matters because `GW_MAX_LIVE_PROFILES=1` means two connected clients *share* one
+browser: before this, the second client's connection destroyed the first one's session.
+Now they take turns, and each switch costs `GW_IDLE_RELEASE_WAITING_MS` plus a browser
+start. Cookies and logins persist in the profile directory; the open page does not.
+
+A session id the gateway does not recognise gets **HTTP 404**, which is the Streamable-HTTP
+signal for "re-initialize". Returning a JSON-RPC error with HTTP 200 instead just surfaces
+as a failed tool call and the client reuses the dead id forever.
+
+### Client capabilities are stripped
+
+The gateway removes `roots`, `sampling` and `elicitation` from every `initialize` it
+forwards. It buffers each POST and owns the upstream session, so a server-to-client request
+has no path back to the real client: `@playwright/mcp` asks for the client's roots, nobody
+answers, and the client's own first tool call hangs until it times out. Measured here: a
+client declaring `roots`+`elicitation` took **88s** for its first browser call; the same
+client declaring none took **2s**. Nothing in this setup needs them — the browser is on the
+phone, so the client's filesystem roots are meaningless and there is no human to elicit
+from. `GW_KEEP_CLIENT_CAPS=1` disables the stripping.
 
 ## Authentication
 

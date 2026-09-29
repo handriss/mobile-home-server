@@ -182,12 +182,54 @@ const SESSION_LOST = /Server not initialized|Bad Request:.*[Ss]ession|session no
 async function rebind(clientSid, profile) {
   const rec = upstreamSessions.get(clientSid);
   if (!rec?.initBody) return null;
-  const u = await profiles.ensure(profile);
-  const upSid = await handshake(u.port, rec.initBody);
+  let u = await profiles.ensure(profile);
+
+  // @playwright/mcp binds its browser to one MCP session per --user-data-dir. Adding a
+  // second session to a live upstream therefore does not get a browser: the call blocks
+  // until the first session goes away, which reads to the client as a hang. If anything
+  // else is already bound to this upstream, take a fresh one.
+  const squatters = [...upstreamSessions.entries()]
+    .filter(([s2, v]) => s2 !== clientSid && v.port === u.port && v.upSid);
+  if (squatters.length) {
+    log('rebind_needs_clean_upstream', { profile, port: u.port, squatters: squatters.length });
+    await profiles.stop(profile);
+    u = await profiles.ensure(profile);
+  }
+
+  const upSid = await handshake(u.port, stripClientCaps(Buffer.from(rec.initBody)));
   if (!upSid) { log('rebind_failed', { sid: shortSid(clientSid), profile, port: u.port }); return null; }
   noteSession(clientSid, u.port, { upSid, profile });
   log('session_rebound', { sid: shortSid(clientSid), profile, port: u.port, up_sid: shortSid(upSid) });
   return u;
+}
+
+// Capabilities that commit the client to answering server-initiated requests. The gateway
+// buffers each POST and owns the upstream session, so a server->client request (roots/list,
+// an elicitation) has no path back to the real client: @playwright/mcp asks, nobody
+// answers, and the client's own tool call hangs until it times out. Measured on this
+// device: a client declaring roots+elicitation took 88s for its first browser call, the
+// same client declaring none took 2s.
+//
+// Nothing here needs them -- the browser runs on the phone, so the client's filesystem
+// roots are meaningless and there is no human to elicit from. Strip them on the way
+// through. Set GW_KEEP_CLIENT_CAPS=1 to stop doing this.
+const STRIP_CLIENT_CAPS = process.env.GW_KEEP_CLIENT_CAPS !== '1';
+const CLIENT_CALLBACK_CAPS = ['roots', 'sampling', 'elicitation'];
+
+/** Remove callback capabilities from an `initialize` body. Returns the body unchanged if
+ *  there is nothing to strip, so non-initialize traffic is never touched. */
+function stripClientCaps(bodyBuf) {
+  if (!STRIP_CLIENT_CAPS) return bodyBuf;
+  let d;
+  try { d = JSON.parse(bodyBuf.toString('utf8')); } catch { return bodyBuf; }
+  if (d?.method !== 'initialize') return bodyBuf;
+  const caps = d?.params?.capabilities;
+  if (!caps) return bodyBuf;
+  const dropped = CLIENT_CALLBACK_CAPS.filter((k) => k in caps);
+  if (!dropped.length) return bodyBuf;
+  for (const k of dropped) delete caps[k];
+  log('client_caps_stripped', { dropped, client: d?.params?.clientInfo?.name ?? null });
+  return Buffer.from(JSON.stringify(d), 'utf8');
 }
 
 /** Replay a stored `initialize` against an upstream; returns the session id it issues. */
@@ -257,7 +299,13 @@ function deleteOne(sid, port) {
     const r = http.request(
       { host: UP_HOST, port, path: '/mcp', method: 'DELETE',
         headers: { 'mcp-session-id': sid, host: `localhost:${port}` } },
-      (res) => { res.resume(); res.on('end', () => resolve(true)); });
+      (res) => {
+        res.resume();
+        res.on('end', () => {
+          if (res.statusCode >= 400) log('upstream_delete_rejected', { sid: shortSid(sid), port, status: res.statusCode });
+          resolve(res.statusCode < 400);
+        });
+      });
     r.setTimeout(4000, () => { r.destroy(); resolve(false); });
     r.on('error', (e) => { log('upstream_delete_failed', { sid: shortSid(sid), port, err: e.message }); resolve(false); });
     r.end();
@@ -273,8 +321,10 @@ async function deleteUpstreamSession(sid) {
   if (!sid) return;
   const known = upstreamSessions.get(sid);
   upstreamSessions.delete(sid);
+  // Rebound sessions live upstream under a different id than the client's.
+  const target = known?.upSid || sid;
   const ports = known?.port ? [known.port] : profiles.livePorts();
-  for (const port of ports) if (await deleteOne(sid, port)) break;
+  for (const port of ports) if (await deleteOne(target, port)) break;
 }
 
 /**
@@ -354,17 +404,27 @@ async function restartUpstream(profile) {
 // could start -- longer than any normal MCP client timeout, so the first call after an
 // idle period always failed. Reclaim unconditionally: an idle holder that comes back
 // simply re-acquires a free lock.
-setInterval(() => {
+let reclaiming = false;
+setInterval(async () => {
+  if (reclaiming) return;
   // inFlight guards against reclaiming a holder in the middle of a slow call: a page load
   // on this phone can outlast IDLE_RELEASE_MS, and it is still legitimately using the browser.
   const grace = lock.waiters.length > 0 ? IDLE_RELEASE_WAITING_MS : IDLE_RELEASE_MS;
   if (lock.owner && lock.inFlight === 0 && Date.now() - lock.lastActivity > grace) {
     const victim = lock.owner;
+    reclaiming = true;
     stats.idleReleases++;
     log('idle_reclaim', { sid: shortSid(victim), idleMs: Date.now() - lock.lastActivity,
                           waiting: lock.waiters.length, grace_ms: grace });
-    deleteUpstreamSession(victim);
-    release('idle');
+    // Await the upstream teardown before handing the browser on. Releasing first let the
+    // next caller in while Playwright still had the browser bound to the old session: it
+    // blocked *inside* the upstream for ~20s with nothing to show for it, instead of
+    // waiting visibly in this queue.
+    // Unbind rather than forget: the reclaimed client is usually still alive and will call
+    // again, and keeping its record lets that call transparently re-establish the session
+    // instead of coming back as "session not found".
+    try { await unbindSession(victim); }
+    finally { release('idle'); reclaiming = false; }
   }
 }, 2_000).unref();
 
@@ -429,7 +489,7 @@ function browserCount() {
     try { cmd = fs.readFileSync(`/proc/${pid}/cmdline`).toString().split('\0'); } catch { continue; }
     if (!cmd[0] || !cmd[0].includes('chromium/chrome')) continue;
     const arg = cmd.find((a) => a.startsWith('--user-data-dir='));
-    if (arg) dirs.add(arg.slice('--user-data-dir='.length));   // helpers inherit no such flag
+    if (arg) dirs.add(arg.slice('--user-data-dir='.length));   // helpers share the parent's dir
   }
   return dirs.size;
 }
@@ -439,7 +499,7 @@ function browserCount() {
  * `buffer`: collect the whole response so we can inspect/rewrite it (POST tool calls).
  * Streaming is used for GET /mcp, which is a long-lived notification channel.
  */
-function proxy(req, res, body, { buffer, port = UP_PORT, upstreamPath = null, upSid = null, clientSid = null }) {
+function proxy(req, res, body, { buffer, port = UP_PORT, upstreamPath = null, upSid = null, clientSid = null, rpcId = null }) {
   return new Promise((resolve) => {
     // @playwright/mcp rejects any request whose Host is not what it bound to, so the
     // Host must name the *target* port, not the gateway's. Profile routes also have to
@@ -484,7 +544,7 @@ function proxy(req, res, body, { buffer, port = UP_PORT, upstreamPath = null, up
       if (settled) return;
       log('upstream_error', { err: e.message, port });
       if (!res.headersSent) {
-        jsonRpcError(res, null, -32001,
+        jsonRpcError(res, rpcId, -32001,
           `Browser backend unreachable on ${UP_HOST}:${port}. The MCP server may be restarting; retry in a few seconds.`);
       } else { res.end(); }
       finish(null);
@@ -505,7 +565,7 @@ const server = http.createServer(async (req, res) => {
   // Always drain the request body, on every path. A half-read body poisons
   // HTTP keep-alive behind cloudflared -- the same failure this repo already
   // hit once with the transcript MCP server.
-  const body = req.method === 'POST' || req.method === 'PUT' ? await readBody(req) : Buffer.alloc(0);
+  let body = req.method === 'POST' || req.method === 'PUT' ? await readBody(req) : Buffer.alloc(0);
 
   // Requests arriving through cloudflared also originate from 127.0.0.1, so the socket
   // address alone cannot distinguish them. cloudflared always stamps forwarding headers;
@@ -609,12 +669,16 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify({ error: route.error }));
   }
 
+  let rpc = null;
+  try { rpc = JSON.parse(body.toString('utf8')); } catch { /* forward opaquely */ }
+  if (rpc?.method === 'initialize') body = stripClientCaps(body);
+
   let upstream;
   try {
     upstream = await profiles.ensure(route.profile);
   } catch (e) {
     log('profile_unavailable', { profile: route.profile, err: e.message });
-    return jsonRpcError(res, null, -32006,
+    return jsonRpcError(res, rpc?.id, -32006,
       `Could not start a browser for profile "${route.profile}": ${e.message}`,
       { profile: route.profile, retry_after_s: 30 });
   }
@@ -637,7 +701,7 @@ const server = http.createServer(async (req, res) => {
   // waiting caller would block the pool for everyone.
   const held = async (opts) => {
     profiles.hold(route.profile);
-    try { return await proxy(req, res, body, opts); }
+    try { return await proxy(req, res, body, { rpcId: rpc?.id ?? null, ...opts }); }
     finally { profiles.unhold(route.profile); }
   };
 
@@ -651,9 +715,6 @@ const server = http.createServer(async (req, res) => {
 
   // GET /mcp is the SSE notification channel -- stream it, never buffer.
   if (req.method === 'GET') return void (await proxy(req, res, body, { buffer: false, ...P }));
-
-  let rpc = null;
-  try { rpc = JSON.parse(body.toString('utf8')); } catch { /* forward opaquely */ }
 
   const toolName = rpc?.method === 'tools/call' ? rpc?.params?.name : null;
   const needsBrowser = typeof toolName === 'string' && toolName.startsWith('browser_');
@@ -692,7 +753,16 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ---- this call wants the browser
-  if (sid && !upstreamSessions.has(sid)) {
+  // No session id: acquire(null) would set lock.owner = null, which reads as "free" to
+  // every other caller -- the lock silently stops serializing. MCP requires a session id
+  // after initialize anyway, so refuse instead.
+  if (!sid) {
+    log('browser_call_without_session', { tool: toolName, profile: route.profile });
+    return jsonRpcError(res, rpc?.id, -32600,
+      'Missing Mcp-Session-Id. Initialize the MCP session first, then send the session id with every call.',
+      { reconnect_required: true }, 400);
+  }
+  if (!upstreamSessions.has(sid)) {
     // A session this gateway never issued (client outlived a restart, or its record was
     // dropped). It can never work, so refuse it up front instead of letting it take the
     // lock and strand everyone behind it -- which is exactly how the browser wedged.
@@ -742,8 +812,13 @@ const server = http.createServer(async (req, res) => {
 
   lock.inFlight++;
   let r;
+  const callStarted = Date.now();
+  log('browser_call', { sid: shortSid(sid), tool: toolName, profile: route.profile,
+                        port: P.port, up_sid: shortSid(P.upSid), rebound: !!P.upSid });
   try {
     r = await held({ buffer: true, ...P });
+    log('browser_call_done', { sid: shortSid(sid), tool: toolName, ms: Date.now() - callStarted,
+                               status: r?.status ?? null, aborted: !!r?.aborted });
     // The upstream can have been replaced between acquiring the lock and this call.
     if (gotBody(r) && sid && SESSION_LOST.test(r.body.toString('utf8'))) {
       const re = await rebind(sid, route.profile);
@@ -875,6 +950,18 @@ server.listen(LISTEN_PORT, LISTEN_HOST, () => {
                      auth: 'oauth2.1 + static bearer', secrets_dir: auth.CONF_DIR });
 });
 
+// server.close() waits for open connections to drain, and cloudflared holds keep-alive
+// sockets open indefinitely -- so the process survived SIGTERM with its port already
+// closed. start.sh then saw "a gateway is running" and skipped starting a new one, leaving
+// the tunnel answering 502 with nothing listening. Drop the connections and hard-exit.
+let shuttingDown = false;
 for (const sig of ['SIGINT', 'SIGTERM']) {
-  process.on(sig, () => { log('shutdown', { sig }); server.close(() => process.exit(0)); });
+  process.on(sig, () => {
+    if (shuttingDown) process.exit(0);
+    shuttingDown = true;
+    log('shutdown', { sig });
+    server.close(() => process.exit(0));
+    server.closeAllConnections?.();
+    setTimeout(() => { log('shutdown_forced', { sig }); process.exit(0); }, 3000).unref();
+  });
 }
