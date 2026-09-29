@@ -33,6 +33,11 @@ CACHE_DIR = os.environ.get("YT_MCP_CACHE", os.path.expanduser("~/.cache/yt-trans
 CACHE_TTL = int(os.environ.get("YT_MCP_TTL", str(30 * 24 * 3600)))
 CHUNK     = int(os.environ.get("YT_MCP_CHUNK", "90000"))
 YTDLP     = os.environ.get("YT_MCP_YTDLP", "yt-dlp")
+# YouTube signs stream URLs behind a JS challenge; unsolved, every format 403s and the frame
+# tools return nothing. Solving it needs a JS runtime plus yt-dlp's EJS solver script. Set
+# YT_MCP_YTDLP_ARGS="" to opt out (captions still work; frames will not).
+YTDLP_ARGS = os.environ.get("YT_MCP_YTDLP_ARGS",
+                            "--js-runtimes node --remote-components ejs:github").split()
 RATE_MAX  = int(os.environ.get("YT_MCP_RATE", "20"))
 CAPTION_UA = os.environ.get("YT_MCP_UA",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -181,7 +186,7 @@ class RateLimited(RuntimeError):
 
 def _caption_sources(video_id: str):
     """Title + caption track maps from one player call. These URLs expire in hours — never cache them."""
-    rc, out, err = _run([YTDLP, "--dump-single-json", "--skip-download", "--no-warnings",
+    rc, out, err = _run([YTDLP, *YTDLP_ARGS, "--dump-single-json", "--skip-download", "--no-warnings",
                          _watch_url(video_id)], timeout=120)
     if rc != 0 or not out.strip():
         tail = (err or "").strip().splitlines()
@@ -263,7 +268,7 @@ def _fetch_via_ytdlp(video_id, lang_key, title):
     """Safety net for when a signed timedtext URL is refused. One exact track — never a glob."""
     with tempfile.TemporaryDirectory() as td:
         out = os.path.join(td, "s")
-        cmd = [YTDLP, "--no-simulate", "--skip-download", "--write-subs", "--write-auto-subs",
+        cmd = [YTDLP, *YTDLP_ARGS, "--no-simulate", "--skip-download", "--write-subs", "--write-auto-subs",
                "--sub-langs", lang_key, "--sub-format", "json3", "--no-warnings",
                "--print", "%(title)s", "-o", out, _watch_url(video_id)]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
@@ -407,7 +412,7 @@ def _get_meta(video_id):
         return json.load(open(cp, encoding="utf-8"))
     with _fetch_lock:
         _rate_gate()
-    cmd = [YTDLP, "--dump-single-json", "--skip-download", "--no-warnings", _watch_url(video_id)]
+    cmd = [YTDLP, *YTDLP_ARGS, "--dump-single-json", "--skip-download", "--no-warnings", _watch_url(video_id)]
     rc, out, err = _run(cmd, timeout=120)
     if rc != 0 or not out.strip():
         tail = (err or "").strip().splitlines()
@@ -422,7 +427,7 @@ def _media_url(video_id, resolution):
     fmt = RES_TIERS.get(resolution, RES_TIERS["low"])["fmt"]
     with _fetch_lock:
         _rate_gate()
-    cmd = [YTDLP, "-f", fmt, "--get-url", "--no-warnings", _watch_url(video_id)]
+    cmd = [YTDLP, *YTDLP_ARGS, "-f", fmt, "--get-url", "--no-warnings", _watch_url(video_id)]
     rc, out, err = _run(cmd, timeout=90)
     url = next((l.strip() for l in out.splitlines() if l.strip().startswith("http")), "")
     if not url:
@@ -480,10 +485,10 @@ def search_youtube(query="", limit=10, sort="relevance"):
         # yt-dlp's ytsearchdate: prefix is broken upstream (still dead in 2026.08.19), so go through
         # YouTube's own date-sorted results URL instead. sp=CAI%3D is "sort by upload date".
         target = "https://www.youtube.com/results?" + urlencode({"search_query": query}) + "&sp=CAI%3D"
-        cmd = [YTDLP, target, "--dump-json", "--flat-playlist", "--no-warnings",
+        cmd = [YTDLP, *YTDLP_ARGS, target, "--dump-json", "--flat-playlist", "--no-warnings",
                "--playlist-end", str(limit * 3)]   # the results page mixes in channels; over-fetch and filter
     else:
-        cmd = [YTDLP, f"ytsearch{limit}:{query}", "--dump-json", "--flat-playlist", "--no-warnings"]
+        cmd = [YTDLP, *YTDLP_ARGS, f"ytsearch{limit}:{query}", "--dump-json", "--flat-playlist", "--no-warnings"]
     rc, out, err = _run(cmd, timeout=90)
     rows = []
     for line in out.splitlines():

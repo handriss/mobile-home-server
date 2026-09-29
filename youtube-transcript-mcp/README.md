@@ -169,3 +169,20 @@ Consequences baked into `server.py`:
 `ytsearchdate:` is also broken upstream (dead in 2026.07.04 and still in 2026.08.19), so
 `sort="date"` goes through YouTube's own `&sp=CAI%3D` results URL and filters out the
 channel/playlist rows that page mixes in.
+
+## Stream URLs need a JS challenge solver (2026-09-29)
+
+`get_frames` / `get_scene_changes` silently returned **0 frames** for a while: YouTube signs
+stream URLs behind a JS challenge, and yt-dlp could not solve it on the phone, so it fell
+back to the `ANDROID_VR` client whose URLs googlevideo answers with **403 Forbidden**. The
+tools reported "0/N frames" rather than an error, which is why this went unnoticed.
+
+Solving the challenge needs both halves, or neither works:
+
+- a JS runtime — `node` is already installed on the phone (yt-dlp only enables `deno` by
+  default, hence `--js-runtimes node`);
+- yt-dlp's EJS solver script, fetched from its GitHub org via `--remote-components ejs:github`.
+
+Both live in `YTDLP_ARGS` in `server.py` and are prepended to every yt-dlp call. Set
+`YT_MCP_YTDLP_ARGS=""` to opt out — captions and search keep working without them, frames
+do not. Requires yt-dlp ≥ 2026.08.19; `--remote-components` does not exist in 2026.07.04.
