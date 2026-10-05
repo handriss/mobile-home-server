@@ -17,11 +17,13 @@ language fallback, disk cache, cursor pagination, and a rate limiter on uncached
 
 Env: YT_MCP_HOST (0.0.0.0), YT_MCP_PORT (8765), YT_MCP_CACHE, YT_MCP_TTL, YT_MCP_CHUNK
      (90000), YT_MCP_YTDLP (yt-dlp), YT_MCP_RATE (uncached fetches/min, 20),
-     YT_MCP_TOKEN (optional shared secret required as 'Authorization: Bearer ...').
+     YT_MCP_TOKEN (optional shared secret required as 'Authorization: Bearer ...'),
+     YT_MCP_UA, YT_MCP_CAPTION_TRIES (4), YT_MCP_CAPTION_BACKOFF (2.0).
 """
 import os, re, json, base64, subprocess, tempfile, time, glob, threading, collections
 import hmac, hashlib, secrets, html
 from urllib.parse import urlparse, parse_qs, urlencode
+import urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
 
@@ -31,7 +33,17 @@ CACHE_DIR = os.environ.get("YT_MCP_CACHE", os.path.expanduser("~/.cache/yt-trans
 CACHE_TTL = int(os.environ.get("YT_MCP_TTL", str(30 * 24 * 3600)))
 CHUNK     = int(os.environ.get("YT_MCP_CHUNK", "90000"))
 YTDLP     = os.environ.get("YT_MCP_YTDLP", "yt-dlp")
+# YouTube signs stream URLs behind a JS challenge; unsolved, every format 403s and the frame
+# tools return nothing. Solving it needs a JS runtime plus yt-dlp's EJS solver script. Set
+# YT_MCP_YTDLP_ARGS="" to opt out (captions still work; frames will not).
+YTDLP_ARGS = os.environ.get("YT_MCP_YTDLP_ARGS",
+                            "--js-runtimes node --remote-components ejs:github").split()
 RATE_MAX  = int(os.environ.get("YT_MCP_RATE", "20"))
+CAPTION_UA = os.environ.get("YT_MCP_UA",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/140.0.0.0 Safari/537.36")
+CAPTION_TRIES   = int(os.environ.get("YT_MCP_CAPTION_TRIES", "4"))
+CAPTION_BACKOFF = float(os.environ.get("YT_MCP_CAPTION_BACKOFF", "2.0"))
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -168,42 +180,146 @@ def extract_video_id(s: str) -> str:
     raise ValueError(f"Could not extract a YouTube video ID from: {s!r}")
 
 
+class RateLimited(RuntimeError):
+    """YouTube throttled the track. Distinct from 'no captions' so callers can tell waiting from hopeless."""
+
+
+def _caption_sources(video_id: str):
+    """Title + caption track maps from one player call. These URLs expire in hours — never cache them."""
+    rc, out, err = _run([YTDLP, *YTDLP_ARGS, "--dump-single-json", "--skip-download", "--no-warnings",
+                         _watch_url(video_id)], timeout=120)
+    if rc != 0 or not out.strip():
+        tail = (err or "").strip().splitlines()
+        msg = tail[-1] if tail else "no output"
+        if "429" in msg or "Too Many Requests" in msg:
+            raise RateLimited(f"YouTube throttled the metadata fetch for {video_id}; retry shortly.")
+        raise RuntimeError(f"metadata fetch failed for {video_id}: {msg}")
+    d = json.loads(out)
+    return (d.get("title") or ""), (d.get("subtitles") or {}), (d.get("automatic_captions") or {})
+
+
+def _json3_url(fmts):
+    return next((f.get("url") for f in (fmts or []) if f.get("ext") == "json3" and f.get("url")), None)
+
+
+def _lang_keys(src, lang):
+    """Track keys for `lang`, best first: exact, then -orig, then any variant sharing the base code."""
+    exact = [lang] if lang in src else []
+    orig  = [k for k in sorted(src) if k == f"{lang}-orig"]
+    rest  = [k for k in sorted(src) if k not in exact and k not in orig and k.split("-")[0] == lang]
+    return exact + orig + rest
+
+
+def _candidates(manual, auto, lang):
+    """Ordered caption tracks to try.
+
+    YouTube serves `tlang=` (machine-translation) requests from a path that 429s constantly while
+    the untranslated track beside it answers every time — that 429, not any quota of ours, is what
+    users hit. So untranslated tracks always go first, however well they match the asked-for language.
+    """
+    codes = ["en"] if lang == "en" else [lang, "en"]
+    out, seen = [], set()
+    for source, src in (("manual", manual), ("auto", auto)):
+        for code in codes:
+            for key in _lang_keys(src, code):
+                url = _json3_url(src.get(key))
+                if url and key not in seen:
+                    seen.add(key)
+                    out.append({"key": key, "url": url, "source": source, "translated": "tlang=" in url})
+    for key in sorted(auto):                      # original-language ASR: worst case, still readable
+        url = _json3_url(auto.get(key))
+        if key.endswith("-orig") and url and "tlang=" not in url and key not in seen:
+            seen.add(key)
+            out.append({"key": key, "url": url, "source": "auto", "translated": False})
+    out.sort(key=lambda c: c["translated"])
+    return out
+
+
+def _fetch_caption_json(url: str, tries: int):
+    """One caption download, retried with backoff."""
+    for attempt in range(tries):
+        last = attempt == tries - 1
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": CAPTION_UA,
+                                                       "Accept-Language": "en-US,en;q=0.9"})
+            with urllib.request.urlopen(req, timeout=45) as r:
+                return json.loads(r.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and last:
+                raise RateLimited(f"HTTP 429 after {tries} attempts")
+            if e.code not in (429, 500, 502, 503, 504) or last:
+                raise RuntimeError(f"HTTP {e.code}")
+        except Exception:
+            if last:
+                raise
+        time.sleep(CAPTION_BACKOFF * (2 ** attempt))
+
+
+def _parse_events(data):
+    lines = []
+    for ev in (data or {}).get("events", []):
+        text = "".join(seg.get("utf8", "") for seg in (ev.get("segs") or [])).strip()
+        if text:
+            lines.append({"start": ev.get("tStartMs", 0) / 1000.0, "text": text})
+    return lines
+
+
+def _fetch_via_ytdlp(video_id, lang_key, title):
+    """Safety net for when a signed timedtext URL is refused. One exact track — never a glob."""
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "s")
+        cmd = [YTDLP, *YTDLP_ARGS, "--no-simulate", "--skip-download", "--write-subs", "--write-auto-subs",
+               "--sub-langs", lang_key, "--sub-format", "json3", "--no-warnings",
+               "--print", "%(title)s", "-o", out, _watch_url(video_id)]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
+        title = next((l.strip() for l in (proc.stdout or "").splitlines() if l.strip()), title)
+        files = glob.glob(os.path.join(td, "*.json3"))
+        if not files:
+            err = (proc.stderr or "").strip().splitlines()
+            raise RuntimeError(err[-1] if err else "no caption file written")
+        return title, _parse_events(json.load(open(files[0], encoding="utf-8")))
+
+
 def _fetch(video_id: str, lang: str):
     with _fetch_lock:
         _rate_gate()
-        with tempfile.TemporaryDirectory() as td:
-            out = os.path.join(td, "s")
-            langs = f"{lang},{lang}.*,{lang}-orig,en,en.*"
-            cmd = [YTDLP, "--no-simulate", "--skip-download", "--write-subs", "--write-auto-subs",
-                   "--sub-langs", langs, "--sub-format", "json3", "--no-warnings",
-                   "--print", "%(title)s", "-o", out,
-                   f"https://www.youtube.com/watch?v={video_id}"]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
-            title = next((l.strip() for l in (proc.stdout or "").splitlines() if l.strip()), "")
-            files = glob.glob(os.path.join(td, "*.json3"))
-            if not files:
-                err = (proc.stderr or "").strip().splitlines()
-                raise RuntimeError(f"No captions for {video_id} (lang={lang}): {err[-1] if err else 'none available'}")
-            files.sort(key=lambda f: 0 if f".{lang}" in os.path.basename(f) else 1)
-            data = json.load(open(files[0], encoding="utf-8"))
-            lines = []
-            for ev in data.get("events", []):
-                text = "".join(seg.get("utf8", "") for seg in (ev.get("segs") or [])).strip()
-                if text:
-                    lines.append({"start": ev.get("tStartMs", 0) / 1000.0, "text": text})
-            if not lines:
-                raise RuntimeError(f"Captions for {video_id} parsed empty.")
-            return title, lines
+        title, manual, auto = _caption_sources(video_id)
+        cands = _candidates(manual, auto, lang)
+        if not cands:
+            have = sorted(set(manual) | set(auto))
+            raise RuntimeError(f"No captions for {video_id} (lang={lang}). "
+                               f"Tracks offered: {', '.join(have[:12]) or 'none'}")
+        problems = []
+        for c in cands:
+            tries = CAPTION_TRIES if c["translated"] else 2
+            try:
+                lines = _parse_events(_fetch_caption_json(c["url"], tries))
+            except Exception as e:
+                problems.append(f"{c['key']}: {e}")
+                continue
+            if lines:
+                return title, lines, c
+            problems.append(f"{c['key']}: parsed empty")
+        try:
+            title, lines = _fetch_via_ytdlp(video_id, cands[0]["key"], title)
+            if lines:
+                return title, lines, cands[0]
+        except Exception as e:
+            problems.append(f"yt-dlp {cands[0]['key']}: {e}")
+        raise RateLimited(f"Could not fetch captions for {video_id} (lang={lang}). "
+                          f"Tried {len(cands)} track(s) — {'; '.join(problems[:4])}. "
+                          "Translated tracks are throttled by YouTube; an untranslated one may exist "
+                          f"under a different lang: {', '.join(sorted(set(manual) | set(auto))[:8])}")
 
 
 def _get(video_id: str, lang: str):
     cp = os.path.join(CACHE_DIR, f"{video_id}.{lang}.json")
     if os.path.exists(cp) and (time.time() - os.path.getmtime(cp)) < CACHE_TTL:
         d = json.load(open(cp, encoding="utf-8"))
-        return d.get("title", ""), d["lines"], True
-    title, lines = _fetch(video_id, lang)
-    json.dump({"title": title, "lines": lines}, open(cp, "w", encoding="utf-8"))
-    return title, lines, False
+        return d.get("title", ""), d["lines"], d.get("track") or {}, True
+    title, lines, track = _fetch(video_id, lang)
+    json.dump({"title": title, "lines": lines, "track": track}, open(cp, "w", encoding="utf-8"))
+    return title, lines, track, False
 
 
 def _format(lines, timestamps):
@@ -221,7 +337,7 @@ def get_transcript(url="", lang="en", timestamps=False, cursor=""):
         video_id, lang, timestamps, offset = _dec(cursor)
     else:
         video_id, offset = extract_video_id(url), 0
-    title, lines, cached = _get(video_id, lang)
+    title, lines, track, cached = _get(video_id, lang)
     full = _format(lines, timestamps)
     chunk = full[offset:offset + CHUNK]
     end = offset + len(chunk)
@@ -229,9 +345,16 @@ def get_transcript(url="", lang="en", timestamps=False, cursor=""):
         sp = chunk.rfind(" ", int(CHUNK * 0.8))
         if sp > 0:
             chunk, end = chunk[:sp], offset + sp
+    key = track.get("key") or lang
+    note = ""
+    if key.split("-")[0] != lang:
+        note = (f"  ·  NOTE: no usable {lang} track; this is the original-language track ({key}). "
+                "YouTube throttles machine-translated tracks.")
     head = (f"# {title or video_id}\n"
-            f"video: https://youtu.be/{video_id}  ·  lang={lang}{', cached' if cached else ''}"
-            f"  ·  chars {offset}-{end} of {len(full)}\n\n")
+            f"video: https://youtu.be/{video_id}  ·  track={key}"
+            f"{' (' + track['source'] + ')' if track.get('source') else ''}"
+            f"{', cached' if cached else ''}"
+            f"  ·  chars {offset}-{end} of {len(full)}{note}\n\n")
     tail = (f'\n\n[Truncated - {len(full)-end} chars remain. Continue with cursor="{_enc(video_id, lang, timestamps, end)}"]'
             if end < len(full) else "")
     return head + chunk + tail
@@ -289,7 +412,7 @@ def _get_meta(video_id):
         return json.load(open(cp, encoding="utf-8"))
     with _fetch_lock:
         _rate_gate()
-    cmd = [YTDLP, "--dump-single-json", "--skip-download", "--no-warnings", _watch_url(video_id)]
+    cmd = [YTDLP, *YTDLP_ARGS, "--dump-single-json", "--skip-download", "--no-warnings", _watch_url(video_id)]
     rc, out, err = _run(cmd, timeout=120)
     if rc != 0 or not out.strip():
         tail = (err or "").strip().splitlines()
@@ -304,7 +427,7 @@ def _media_url(video_id, resolution):
     fmt = RES_TIERS.get(resolution, RES_TIERS["low"])["fmt"]
     with _fetch_lock:
         _rate_gate()
-    cmd = [YTDLP, "-f", fmt, "--get-url", "--no-warnings", _watch_url(video_id)]
+    cmd = [YTDLP, *YTDLP_ARGS, "-f", fmt, "--get-url", "--no-warnings", _watch_url(video_id)]
     rc, out, err = _run(cmd, timeout=90)
     url = next((l.strip() for l in out.splitlines() if l.strip().startswith("http")), "")
     if not url:
@@ -356,10 +479,16 @@ def search_youtube(query="", limit=10, sort="relevance"):
     if not query:
         raise ValueError("query is required")
     limit = max(1, min(int(limit), SEARCH_MAX))
-    prefix = "ytsearchdate" if sort == "date" else "ytsearch"
     with _fetch_lock:
         _rate_gate()
-    cmd = [YTDLP, f"{prefix}{limit}:{query}", "--dump-json", "--flat-playlist", "--no-warnings"]
+    if sort == "date":
+        # yt-dlp's ytsearchdate: prefix is broken upstream (still dead in 2026.08.19), so go through
+        # YouTube's own date-sorted results URL instead. sp=CAI%3D is "sort by upload date".
+        target = "https://www.youtube.com/results?" + urlencode({"search_query": query}) + "&sp=CAI%3D"
+        cmd = [YTDLP, *YTDLP_ARGS, target, "--dump-json", "--flat-playlist", "--no-warnings",
+               "--playlist-end", str(limit * 3)]   # the results page mixes in channels; over-fetch and filter
+    else:
+        cmd = [YTDLP, *YTDLP_ARGS, f"ytsearch{limit}:{query}", "--dump-json", "--flat-playlist", "--no-warnings"]
     rc, out, err = _run(cmd, timeout=90)
     rows = []
     for line in out.splitlines():
@@ -371,12 +500,15 @@ def search_youtube(query="", limit=10, sort="relevance"):
         except Exception:
             continue
         vid = d.get("id", "")
+        if not VIDEO_ID_RE.match(vid):
+            continue
         rows.append({
             "title": d.get("title", ""), "id": vid, "url": f"https://youtu.be/{vid}",
             "channel": d.get("channel") or d.get("uploader") or "",
             "duration": d.get("duration"), "view_count": d.get("view_count"),
             "upload_date": d.get("upload_date"),
         })
+    rows = rows[:limit]
     if not rows:
         tail = (err or "").strip().splitlines()
         raise RuntimeError(f"no results for {query!r}: {tail[-1] if tail else 'none'}")
@@ -761,7 +893,7 @@ def dispatch(method, params):
         return {
             "protocolVersion": pv if pv in PROTOCOL_VERSIONS else "2025-06-18",
             "capabilities": {"tools": {"listChanged": False}, "prompts": {"listChanged": False}},
-            "serverInfo": {"name": "youtube-transcript", "version": "2.0.1"},
+            "serverInfo": {"name": "youtube-transcript", "version": "2.0.2"},
         }
     if method == "tools/list":
         return {"tools": TOOLS}
