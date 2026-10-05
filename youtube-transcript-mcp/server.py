@@ -56,12 +56,81 @@ META_TTL      = int(os.environ.get("YT_MCP_META_TTL", str(24 * 3600)))
 FRAME_WORKERS = int(os.environ.get("YT_MCP_FRAME_WORKERS", "6"))   # concurrent ffmpeg seeks
 IN_PRICE_PER_M = 5.0  # rough $/1M input tokens (Opus tier) for cost estimates
 
-# Resolution tiers: ffmpeg output height, approx Claude image tokens/frame ((w*h)/750 @ 16:9),
-# and the yt-dlp format selector for the source stream (no "+" merges — single URL to seek).
+# Resolution tiers. Per tier: ffmpeg output height, Claude visual tokens for a 16:9 frame
+# (ceil(w/28) * ceil(h/28) — Claude sees images as 28x28-pixel patches), the yt-dlp format
+# selector, JPEG -q:v, per-call frame cap, concurrent ffmpeg seeks, and the ffmpeg timeout.
+#
+# ABOVE 720p YouTube SERVES ONLY VIDEO-ONLY DASH. That is fine here (we never want audio) and
+# each is still a single seekable URL — the "no + merges" rule is about merged A/V, not about
+# staying under 720p. Anonymous access is NOT a limit either: the full 144p..2160p ladder is
+# offered without login. h264 stops at 1080p (137/299), so 1440p forces VP9/AV1 SOFTWARE decode,
+# which is slow and hot on a phone — hence fewer workers and longer timeouts on the big tiers.
+#
+# The frame caps are not arbitrary; they are Claude API request limits:
+#   * >20 images in ONE request imposes a stricter per-image dimension limit on EVERY image in
+#     it (keep each side <= 2000px, or stay at <= 20 image blocks) — and images resent from
+#     earlier turns count too. 1440p is 2560 wide, so it is capped at 20 frames/call.
+#   * the 32MB request ceiling binds before the frame cap at 1080p (~550KB of base64 per
+#     frame), hence 30.
 RES_TIERS = {
-    "low":  {"h": 360, "tok": 350,  "fmt": "18/worst[vcodec!=none][acodec!=none]/worst[vcodec!=none]"},
-    "high": {"h": 720, "tok": 1230, "fmt": "136/22/247/298/bestvideo[height<=720]/18"},
+    "360p":  {"h": 360,  "tok": 299,  "q": 5, "cap": 50, "workers": 6, "timeout": 60,
+              "fmt": "18/134/243/396/worst[vcodec!=none][acodec!=none]/worst[vcodec!=none]"},
+    "480p":  {"h": 480,  "tok": 558,  "q": 4, "cap": 50, "workers": 6, "timeout": 60,
+              "fmt": "135/244/397/bestvideo[height<=480]/18"},
+    "720p":  {"h": 720,  "tok": 1196, "q": 3, "cap": 50, "workers": 6, "timeout": 60,
+              "fmt": "136/247/298/302/bestvideo[height<=720]/18"},
+    "1080p": {"h": 1080, "tok": 2691, "q": 3, "cap": 30, "workers": 3, "timeout": 120,
+              "fmt": "137/299/248/303/399/bestvideo[height<=1080]/136/18"},
+    # q=4 (not 3) at 1440p keeps 20 frames of base64 clear of the 32MB request ceiling.
+    "1440p": {"h": 1440, "tok": 4784, "q": 4, "cap": 20, "workers": 2, "timeout": 180,
+              "fmt": "271/308/400/bestvideo[height<=1440]/137/18"},
 }
+# The original two tier names stay valid forever — they are baked into the MCP prompts above
+# and into whatever client config is already deployed.
+RES_ALIASES = {"low": "360p", "high": "720p", "medium": "480p", "hd": "1080p", "max": "1440p"}
+RES_DEFAULT = "360p"
+
+
+def _resolve_res(resolution):
+    """(tier name, tier dict) for a requested resolution; accepts legacy aliases."""
+    r = RES_ALIASES.get((resolution or "").strip().lower(), (resolution or "").strip().lower())
+    return (r, RES_TIERS[r]) if r in RES_TIERS else (RES_DEFAULT, RES_TIERS[RES_DEFAULT])
+
+
+# A model cannot be told apart by this server — claude.ai, Claude Code and a CLI bearer all look
+# the same over MCP — so the tools must state the resolution ceilings out loud and let the caller
+# self-select. Oversized frames are downscaled BEFORE the model sees them: the caller pays this
+# phone's decode time and the transport for detail that is then discarded, and is billed for the
+# smaller image anyway. This text is surfaced in the tool descriptions, in estimate_frames, in the
+# get_frames footer and in the workflow prompts.
+VISION_LIMITS = """IMAGE RESOLUTION — ONLY REQUEST WHAT YOU CAN ACTUALLY INGEST.
+Every Claude model has a maximum native image resolution. A frame above it is downscaled before
+you ever see it, and you are billed for the downscaled image — so asking for a tier you cannot
+ingest costs real time and money and buys you nothing. Pick a tier from YOUR OWN limits:
+- High-resolution vision (Claude 4.7 and later — e.g. Opus 5, Sonnet 5): long edge 2576px, max
+  4784 visual tokens. 1440p is your ceiling. 4K would be downscaled to 2576x1449 for the
+  IDENTICAL token cost, so there is never a reason to ask for more than 1440p.
+- Standard vision (Claude 4.6 and earlier — e.g. Opus 4.6, Sonnet 4.6, Haiku 4.5): long edge
+  1568px, max 1568 visual tokens. 720p is your ceiling. A 1080p or 1440p frame is downscaled to
+  ~1456x819 and billed ~1560 tokens — strictly worse than having asked for 720p.
+If you do not know which you are, assume standard vision and stay at 720p or below.
+Resolution is also no substitute for framing: a 720p frame of a tightly-shot slide carries more
+readable text than a 1440p frame of a wide stage shot. And note >20 images in one request forces
+every image in it under 2000px, which is why the 1440p tier is capped at 20 frames per call."""
+
+# Derived once, so the schemas, the prompts and the caps can never drift from RES_TIERS.
+RES_ENUM = list(RES_TIERS) + list(RES_ALIASES)
+RES_CAPS = {k: v["cap"] for k, v in RES_TIERS.items()}
+RES_CAPS_DOC = ", ".join(f"{k}={v}" for k, v in RES_CAPS.items())
+RES_COST_DOC = ", ".join(f"{k} ~{v['tok']}" for k, v in RES_TIERS.items())
+RES_PARAM_DOC = (
+    "Frame resolution. Visual tokens per frame: " + RES_COST_DOC + ". "
+    "Escalate only when you need the detail, and NEVER above your own max native image "
+    "resolution — a bigger frame than you can ingest is downscaled before you see it and "
+    "billed at the smaller size (Claude 4.7+ / Opus 5 / Sonnet 5: 1440p ceiling; Claude 4.6 "
+    "and earlier: 720p ceiling). 360p screens, 720p reads slide text, 1080p/1440p read dense "
+    "charts and fine print. Aliases: low=360p, medium=480p, high=720p, hd=1080p, max=1440p."
+)
 
 _frame_recent = collections.deque()          # timestamps of recently-served frames (rate limit)
 _frame_lock   = threading.Lock()
@@ -380,7 +449,7 @@ def _get_meta(video_id):
 
 def _media_url(video_id, resolution):
     """Fresh direct stream URL for a resolution tier (URLs expire, so never cached)."""
-    fmt = RES_TIERS.get(resolution, RES_TIERS["low"])["fmt"]
+    fmt = _resolve_res(resolution)[1]["fmt"]
     with _fetch_lock:
         _rate_gate()
     cmd = [YTDLP, "-f", fmt, "--get-url", "--no-warnings", _watch_url(video_id)]
@@ -419,12 +488,12 @@ def _timestamps(start, end, interval, max_frames):
     return ts
 
 
-def _extract_frame(media_url, t, scale_h, q, outpath):
+def _extract_frame(media_url, t, scale_h, q, outpath, timeout=60):
     """Fast input-seek extraction of a single frame (decodes ~1 keyframe, not the whole stream)."""
     cmd = [FFMPEG, "-nostdin", "-loglevel", "error", "-ss", f"{t}", "-i", media_url,
            "-frames:v", "1", "-vf", f"scale=-2:{scale_h}", "-q:v", str(q), outpath, "-y"]
     try:
-        rc, _, _ = _run(cmd, timeout=60)
+        rc, _, _ = _run(cmd, timeout=timeout)
     except subprocess.TimeoutExpired:
         return False
     return rc == 0 and os.path.exists(outpath) and os.path.getsize(outpath) > 0
@@ -509,7 +578,7 @@ def get_video_info(url=""):
     return "\n".join(L)
 
 
-def estimate_frames(url="", start_s=0, end_s=None, interval=30, resolution="low"):
+def estimate_frames(url="", start_s=0, end_s=None, interval=30, resolution=RES_DEFAULT):
     """Dry run: how many frames + token/cost estimate for a get_frames call. Pulls NO images."""
     vid = extract_video_id(url)
     m = _get_meta(vid)
@@ -519,41 +588,49 @@ def estimate_frames(url="", start_s=0, end_s=None, interval=30, resolution="low"
     end = float(end_s) if end_s is not None else dur
     if dur:
         end = min(end, dur)
-    span = max(0.0, end - start)
     n_raw = len(_timestamps(start, end if end > start else start + interval_eff, interval_eff, 10 ** 9))
-    n_capped = min(n_raw, FRAME_HARD_CAP)
-    tier = RES_TIERS.get(resolution, RES_TIERS["low"])
-    tok = n_capped * tier["tok"]
-    dollars = tok / 1e6 * IN_PRICE_PER_M
-    lo = n_capped * RES_TIERS["low"]["tok"]
-    hi = n_capped * RES_TIERS["high"]["tok"]
+    name, _ = _resolve_res(resolution)
+
+    rows = ["| tier  | tok/frame | frames/call | tokens this call |      $ | calls for range |",
+            "|-------|-----------|-------------|------------------|--------|-----------------|"]
+    for tn, t in RES_TIERS.items():
+        n = min(n_raw, t["cap"])
+        tok = n * t["tok"]
+        calls = max(1, -(-n_raw // t["cap"]))
+        sel = "  <-- selected" if tn == name else ""
+        rows.append(f"| {tn:<5} | {t['tok']:>9,} | {n:>4} / {t['cap']:<4} | {tok:>16,} | "
+                    f"${tok / 1e6 * IN_PRICE_PER_M:>5.2f} | {calls:>15} |{sel}")
+
     out = [
         f"# Frame estimate — {m.get('title') or vid}",
         f"video length: {_mmss(dur)} ({dur:.0f}s)" if dur else "video length: unknown",
         f"range: {_mmss(start)}–{_mmss(end)}  ·  interval: {interval_eff}s"
         + (f" (raised from {interval}s; min is {MIN_INTERVAL}s)" if interval_eff != int(interval) else ""),
         "",
-        f"frames at this interval: **{n_raw}**"
-        + (f"  →  capped to **{n_capped}** per call (max {FRAME_HARD_CAP}); "
-           f"you'd need {-(-n_raw // FRAME_HARD_CAP)} calls to cover the whole range"
-           if n_raw > n_capped else ""),
+        f"frames the range wants at this interval: **{n_raw}**",
         "",
-        f"cost for {n_capped} frames:",
-        f"- low res  (~{RES_TIERS['low']['tok']} tok/frame): ~{lo:,} tokens  ≈ ${lo/1e6*IN_PRICE_PER_M:.2f}",
-        f"- high res (~{RES_TIERS['high']['tok']} tok/frame): ~{hi:,} tokens  ≈ ${hi/1e6*IN_PRICE_PER_M:.2f}",
+        "\n".join(rows),
         "",
-        f"(dry run — no frames pulled. Selected tier `{resolution}` ≈ {tok:,} tokens ≈ ${dollars:.2f}.)",
+        "Frame caps differ per tier because the Claude API limits requests, not because of this "
+        "server: >20 images in one request forces every image in it under 2000px, and the 32MB "
+        "request ceiling binds before the frame count does at 1080p.",
+        "",
+        VISION_LIMITS,
+        "",
+        "(dry run — no frames pulled, nothing billed.)",
     ]
     return "\n".join(out)
 
 
-def get_frames(url="", start_s=0, end_s=None, interval=30, resolution="low", max_frames=FRAME_DEFAULT):
-    """Return sampled frames as image blocks. Caps: interval>=MIN_INTERVAL, <=FRAME_HARD_CAP frames/call."""
+def get_frames(url="", start_s=0, end_s=None, interval=30, resolution=RES_DEFAULT,
+               max_frames=FRAME_DEFAULT):
+    """Return sampled frames as image blocks. Caps: interval >= MIN_INTERVAL, per-tier frame cap."""
     vid = extract_video_id(url)
-    resolution = resolution if resolution in RES_TIERS else "low"
-    tier = RES_TIERS[resolution]
-    interval = max(int(interval), MIN_INTERVAL)                 # hard cap: min interval
-    max_frames = max(1, min(int(max_frames), FRAME_HARD_CAP))   # hard cap: frames/call
+    name, tier = _resolve_res(resolution)
+    interval = max(int(interval), MIN_INTERVAL)        # hard cap: min interval
+    cap = min(tier["cap"], FRAME_HARD_CAP)             # hard cap: frames/call, per tier
+    want = max(1, int(max_frames))
+    max_frames = min(want, cap)
     m = _get_meta(vid)
     dur = float(m.get("duration") or 0)
     start = max(0.0, float(start_s))
@@ -566,18 +643,21 @@ def get_frames(url="", start_s=0, end_s=None, interval=30, resolution="low", max
     if not ts:
         raise ValueError("empty time range")
     _frame_gate(len(ts))
-    media = _media_url(vid, resolution)
-    q = 5 if resolution == "low" else 3
-    blocks = [{"type": "text", "text":
-               f"# Frames — {m.get('title') or vid}\n"
-               f"video: https://youtu.be/{vid} · {resolution} res · {len(ts)} frames "
-               f"@ {interval}s over {_mmss(start)}–{_mmss(ts[-1])}\n"}]
+    media = _media_url(vid, name)
+    head = (f"# Frames — {m.get('title') or vid}\n"
+            f"video: https://youtu.be/{vid} · {name} (~{tier['tok']} tok/frame) · {len(ts)} frames "
+            f"@ {interval}s over {_mmss(start)}–{_mmss(ts[-1])}\n")
+    if want > max_frames:
+        head += (f"\n[max_frames lowered {want} -> {max_frames}: the {name} tier is capped at {cap} "
+                 f"frames per call. Split the range across calls, or drop to a smaller tier.]\n")
+    blocks = [{"type": "text", "text": head}]
     with tempfile.TemporaryDirectory() as td:
         def job(it):
             i, t = it
             p = os.path.join(td, f"f{i:04d}.jpg")
-            return (t, p if _extract_frame(media, t, tier["h"], q, p) else None)
-        with ThreadPoolExecutor(max_workers=FRAME_WORKERS) as ex:
+            ok = _extract_frame(media, t, tier["h"], tier["q"], p, tier["timeout"])
+            return (t, p if ok else None)
+        with ThreadPoolExecutor(max_workers=tier["workers"]) as ex:
             results = list(ex.map(job, enumerate(ts)))
         got = 0
         for t, p in results:
@@ -590,11 +670,18 @@ def get_frames(url="", start_s=0, end_s=None, interval=30, resolution="low", max
             got += 1
     tokens = got * tier["tok"]
     cum = _add_cost(vid, got, tokens)
-    blocks.append({"type": "text", "text":
-                   f"\nReturned {got}/{len(ts)} frames (~{tokens // 1000}k tokens, {resolution} res). "
-                   f"Cumulative this video this session: {cum['frames']} frames "
-                   f"(~{cum['tokens'] // 1000}k tokens ≈ ${cum['tokens']/1e6*IN_PRICE_PER_M:.2f}). "
-                   f"[caps: interval ≥ {MIN_INTERVAL}s, ≤ {FRAME_HARD_CAP} frames/call]"})
+    foot = (f"\nReturned {got}/{len(ts)} frames at {name} (~{tokens // 1000}k tokens). "
+            f"Cumulative this video this session: {cum['frames']} frames "
+            f"(~{cum['tokens'] // 1000}k tokens ≈ ${cum['tokens'] / 1e6 * IN_PRICE_PER_M:.2f}). "
+            f"[caps: interval ≥ {MIN_INTERVAL}s, ≤ {cap} frames/call at {name}]")
+    if tier["h"] > 720:
+        foot += (f"\n\nRESOLUTION CHECK: {name} is above the STANDARD-vision ceiling (1568px long "
+                 f"edge). If you are Claude 4.6 or earlier (Opus 4.6 / Sonnet 4.6 / Haiku 4.5) these "
+                 f"frames were downscaled to ~1456x819 before you saw them and billed ~1560 tokens "
+                 f"each — you paid more than 720p and received less. Ask for 720p next time. If you "
+                 f"are Claude 4.7+ (Opus 5 / Sonnet 5) you received them intact at ~{tier['tok']} "
+                 f"tokens each; 1440p is your ceiling, above which frames are downscaled anyway.")
+    blocks.append({"type": "text", "text": foot})
     return blocks
 
 
@@ -673,9 +760,10 @@ TOOLS = [
     },
     {
         "name": "estimate_frames",
-        "description": "DRY RUN — pulls NO images. Returns how many frames a get_frames call would produce "
-                       "for a range/interval, plus token and dollar cost estimates at low and high res. Call "
-                       "this to plan before spending on frames.",
+        "description": "DRY RUN — pulls NO images. Returns how many frames a get_frames call would "
+                       "produce for a range/interval, plus a per-tier table of token and dollar cost at "
+                       "EVERY resolution (and each tier's frame cap), followed by the resolution limits "
+                       "you should pick against. Call this to plan before spending on frames.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -683,18 +771,24 @@ TOOLS = [
                 "start_s": {"type": "number", "description": "Range start (seconds)", "default": 0},
                 "end_s": {"type": "number", "description": "Range end (seconds); default = end of video"},
                 "interval": {"type": "number", "description": f"Seconds between frames (min {MIN_INTERVAL})", "default": 30},
-                "resolution": {"type": "string", "enum": ["low", "high"], "default": "low"},
+                "resolution": {"type": "string", "enum": RES_ENUM,
+                               "description": "Tier to mark as selected; the table covers all of them",
+                               "default": RES_DEFAULT},
             },
             "required": ["url"],
         },
     },
     {
         "name": "get_frames",
-        "description": "Extract sampled video frames as images for visual analysis. Returns image blocks "
-                       "labeled with timestamps. Frames cost tokens — prefer low res + coarse intervals for "
-                       f"screening, high res only on confirmed hits. Hard caps: interval >= {MIN_INTERVAL}s, "
-                       f"<= {FRAME_HARD_CAP} frames/call (default {FRAME_DEFAULT}). Call estimate_frames first "
-                       "if unsure of the cost.",
+        "description": "Extract sampled video frames as images for visual analysis. Returns image "
+                       "blocks labeled with timestamps. Frames cost tokens — screen at 360p with coarse "
+                       "intervals, and escalate resolution only on confirmed hits. DO NOT request a tier "
+                       "above your own maximum native image resolution: oversized frames are downscaled "
+                       "before you see them and billed at the smaller size, so you pay more and see less "
+                       "(Claude 4.7+ e.g. Opus 5 / Sonnet 5: up to 1440p; Claude 4.6 and earlier: 720p is "
+                       f"the ceiling). Hard caps: interval >= {MIN_INTERVAL}s, and a per-tier frames/call "
+                       f"cap ({RES_CAPS_DOC}; default {FRAME_DEFAULT}). "
+                       "Call estimate_frames first if unsure of the cost.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -702,8 +796,11 @@ TOOLS = [
                 "start_s": {"type": "number", "description": "Range start (seconds)", "default": 0},
                 "end_s": {"type": "number", "description": "Range end (seconds); default = end of video"},
                 "interval": {"type": "number", "description": f"Seconds between frames (clamped to >= {MIN_INTERVAL})", "default": 30},
-                "resolution": {"type": "string", "enum": ["low", "high"], "description": "low ~360p (cheap screening) / high ~720p (read text/charts)", "default": "low"},
-                "max_frames": {"type": "integer", "description": f"Cap on frames returned (<= {FRAME_HARD_CAP})", "default": FRAME_DEFAULT},
+                "resolution": {"type": "string", "enum": RES_ENUM, "default": RES_DEFAULT,
+                               "description": RES_PARAM_DOC},
+                "max_frames": {"type": "integer", "default": FRAME_DEFAULT,
+                               "description": f"Cap on frames returned. Clamped to the chosen tier's "
+                                              f"cap ({RES_CAPS_DOC})"},
             },
             "required": ["url"],
         },
@@ -745,16 +842,21 @@ get_video_info, estimate_frames, get_frames, get_scene_changes.
 COST MODEL (internalize this — it drives every decision):
 - Text is nearly free. The transcript and get_scene_changes are pixel-free reconnaissance — use
   them to decide WHERE to look before spending on pixels.
-- Frames are the expensive part. Each frame costs image tokens (low res ~350, high res ~1230).
-  Cost = frames x tokens/frame, and it is strictly linear — 10x the frames is 10x the cost.
-- Hard caps are enforced by the tools: interval >= {MIN_INTERVAL}s, <= {FRAME_HARD_CAP} frames per
-  call. Stay well under them; they are a backstop, not a target.
+- Frames are the expensive part. Visual tokens per frame: {RES_COST_DOC}. Cost = frames x
+  tokens/frame, and it is strictly linear — 10x the frames is 10x the cost, and one 1440p frame
+  costs as much as sixteen 360p ones.
+- Hard caps are enforced by the tools: interval >= {MIN_INTERVAL}s, and frames per call per tier
+  ({RES_CAPS_DOC}). Stay well under them; they are a backstop, not a target.
+
+{VISION_LIMITS}
 
 UNIVERSAL STRATEGY (apply to any visual request):
 1. Transcript first. It is cheap and usually tells you where the interesting moments are.
-2. Coarse before fine. Screen with wide intervals + LOW resolution; never scan at high res.
-3. Confirm, then escalate. Only pull ONE high-res frame once you've confirmed (from a low-res
-   frame) that the thing you want is actually on screen at that timestamp.
+2. Coarse before fine. Screen with wide intervals at 360p; never sweep above 360p.
+3. Confirm, then escalate. Only pull ONE higher-res frame once you've confirmed (from a 360p
+   frame) that the thing you want is actually on screen at that timestamp. Escalate one step at
+   a time — 720p reads most slide text, and a tight 720p shot beats a wide 1440p one. Go to
+   1080p/1440p only for dense charts or fine print, and only if you can ingest them.
 4. Plan before spending. If a range might be large, call estimate_frames first.
 5. Watch the cost footer. get_frames reports cumulative frames/tokens for the video — keep an eye on it.
 6. Fan out when you can. Each frame is independent — if you have sub-agents, have each analyze its
@@ -771,8 +873,8 @@ EXAMPLE WORKFLOWS
 - Find a person/object ("the guy in the pink shirt") and timestamp it: screen the whole video at a
   coarse interval (e.g. 20-30s) in LOW res; for any frame that might match, sample +/- a few frames
   densely around it to pin the moment; confirm with one high-res frame. Report the timestamp.
-- Summarize what's shown on screen: transcript for what's SAID; coarse low-res frame sweep for what's
-  SHOWN; combine. Only go high res on frames that carry unreadable detail.
+- Summarize what's shown on screen: transcript for what's SAID; coarse 360p frame sweep for what's
+  SHOWN; combine. Only escalate resolution on frames that carry unreadable detail.
 """
 
 CHARTS_WORKFLOW = """Goal: find every DISTINCT chart/graph/diagram in the video and explain each,
@@ -781,20 +883,22 @@ cheaply.
 Strategy (cheap -> expensive, coarse -> fine):
 1. get_transcript (with timestamps). Scan it for chart references: "as this chart shows", "the graph",
    "these numbers", "look at this", "on the y-axis", etc. Collect candidate timestamps.
-2. PRIMARY PATH: for each candidate, get_frames at LOW res, a few frames around that timestamp
+2. PRIMARY PATH: for each candidate, get_frames at 360p, a few frames around that timestamp
    (interval ~5-10s, small max_frames), to confirm a chart is actually on screen — the words and the
    visual don't always line up.
 3. FALLBACK PATH: if the transcript is unhelpful (few/no references, or it's a screen-share with
    little narration), use get_scene_changes over bounded ranges to find cuts-to-graphics, or a coarse
-   low-res sweep of the whole video. Don't rely on the words alone.
+   360p sweep of the whole video. Don't rely on the words alone.
 4. DEDUP: the same chart is often referenced more than once. Collapse to DISTINCT charts before
-   spending on high res.
-5. For each confirmed, distinct chart, get_frames ONE high-res frame at the cleanest timestamp and
-   read it carefully.
+   spending on the expensive tiers.
+5. For each confirmed, distinct chart, get_frames ONE frame at the cleanest timestamp and read it
+   carefully. Start at 720p; step up to 1080p (or 1440p for very dense axis labels) only if the
+   numbers are genuinely unreadable AND your model can ingest that resolution — see the
+   resolution rules above.
 6. Return each chart with its timestamp and an explanation of what it shows.
 
-Be conservative with frames — a handful of charts should cost a few dozen low-res screening frames
-plus a handful of high-res reads, not hundreds. Use estimate_frames if a range looks large.
+Be conservative with frames — a handful of charts should cost a few dozen 360p screening frames
+plus a handful of higher-res reads, not hundreds. Use estimate_frames if a range looks large.
 """
 
 PROMPTS = [
@@ -840,7 +944,7 @@ def dispatch(method, params):
         return {
             "protocolVersion": pv if pv in PROTOCOL_VERSIONS else "2025-06-18",
             "capabilities": {"tools": {"listChanged": False}, "prompts": {"listChanged": False}},
-            "serverInfo": {"name": "youtube-transcript", "version": "2.1.0"},
+            "serverInfo": {"name": "youtube-transcript", "version": "2.2.0"},
         }
     if method == "tools/list":
         return {"tools": TOOLS}
