@@ -1,4 +1,7 @@
-yt-dlp>=2026.7.4
+# Keep this current: YouTube breaks older extractors, and 2026.7.4's android_vr client
+# throws 403s until the 2026.8.19 fix. `pip install -U yt-dlp` on the phone when fetches
+# start failing — that is the first thing to try for any new HTTP error from YouTube.
+yt-dlp>=2026.8.19
 # The server uses ONLY the Python standard library + yt-dlp (subprocess).
 # No `mcp` SDK: it needs pydantic-core (Rust), which won't build on Termux/Android,
 # so server.py hand-rolls the MCP Streamable-HTTP slice it needs. Nothing else to install.

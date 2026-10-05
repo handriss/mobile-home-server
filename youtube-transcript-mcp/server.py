@@ -13,7 +13,9 @@ WHY yt-dlp: youtube-captions-scraper / youtubei.js are broken vs current YouTube
 yt-dlp works — verified on the phone (title + transcript, EN/ES, short/long).
 
 Tool: get_transcript(url, lang="en", timestamps=False, cursor="")  -> title + transcript,
-language fallback, disk cache, cursor pagination, and a rate limiter on uncached fetches.
+original-language fallback (YouTube 429s auto-TRANSLATED caption tracks, so we serve the
+untranslated track rather than fail — see _fetch), disk cache, cursor pagination, and a
+rate limiter on uncached fetches.
 
 Env: YT_MCP_HOST (0.0.0.0), YT_MCP_PORT (8765), YT_MCP_CACHE, YT_MCP_TTL, YT_MCP_CHUNK
      (90000), YT_MCP_YTDLP (yt-dlp), YT_MCP_RATE (uncached fetches/min, 20),
@@ -168,42 +170,114 @@ def extract_video_id(s: str) -> str:
     raise ValueError(f"Could not extract a YouTube video ID from: {s!r}")
 
 
+# WHY THE 429s: YouTube hard-throttles AUTO-TRANSLATED caption tracks. Asking for `en` on a
+# video whose captions are Korean hits the /timedtext translate endpoint and is refused with
+# "HTTP Error 429: Too Many Requests" almost every time — it is not a volume limit, so a
+# fresh IP that has fetched nothing all day still gets it. Manual subtitles and the video's
+# ORIGINAL-language auto-captions are NOT throttled (yt-dlp #13831). The old lang string
+# ("...,en,en.*") therefore steered every non-English video straight into the throttle.
+# Fix: ask for the requested language first (normally the original, so nothing changes and
+# nothing extra is fetched), and on failure fall back to the original track. We do NOT retry
+# the throttled request — upstream reports each retry restarts the throttle timer.
+class RateLimited(RuntimeError):
+    """YouTube refused this caption track with a 429; another track may still work."""
+
+
+_RATE_429 = re.compile(r"HTTP Error 429|Too Many Requests")
+
+
+def _fetch_langs(video_id: str, langs: str, prefer: str):
+    """One yt-dlp caption fetch for `langs`. Returns (title, lines, actual_lang)."""
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "s")
+        cmd = [YTDLP, "--no-simulate", "--skip-download", "--write-subs", "--write-auto-subs",
+               "--sub-langs", langs, "--sub-format", "json3", "--no-warnings",
+               "--print", "%(title)s", "-o", out,
+               f"https://www.youtube.com/watch?v={video_id}"]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
+        title = next((l.strip() for l in (proc.stdout or "").splitlines() if l.strip()), "")
+        files = glob.glob(os.path.join(td, "*.json3"))
+        if not files:
+            err = (proc.stderr or "").strip()
+            last = next((l for l in reversed(err.splitlines()) if l.strip()), "none available")
+            raise (RateLimited if _RATE_429.search(err) else RuntimeError)(last)
+        # exact requested track first, then its "-orig" variant, then whatever else arrived
+        files.sort(key=lambda f: (0 if f.endswith(f".{prefer}.json3") else
+                                  1 if f.endswith(f".{prefer}-orig.json3") else 2, f))
+        actual = os.path.basename(files[0])[2:-len(".json3")]   # "s.ko-orig.json3" -> "ko-orig"
+        data = json.load(open(files[0], encoding="utf-8"))
+        lines = []
+        for ev in data.get("events", []):
+            text = "".join(seg.get("utf8", "") for seg in (ev.get("segs") or [])).strip()
+            if text:
+                lines.append({"start": ev.get("tStartMs", 0) / 1000.0, "text": text})
+        if not lines:
+            raise RuntimeError(f"Captions for {video_id} parsed empty.")
+        return title, lines, actual
+
+
+def _safe_tracks(video_id: str, lang: str):
+    """Caption tracks YouTube actually serves: creator-uploaded subtitles and the ORIGINAL-
+    language auto-captions. Auto-TRANSLATED tracks are the throttled ones, so they are never
+    listed here — one 429 fails the whole yt-dlp run, including the tracks that would work.
+    Returns (sub-langs spec in preference order, preferred lang), or ("", "")."""
+    cmd = [YTDLP, "--dump-single-json", "--skip-download", "--no-warnings",
+           f"https://www.youtube.com/watch?v={video_id}"]
+    rc, out, _ = _run(cmd, timeout=120)
+    if rc != 0 or not (out or "").strip():
+        return "", ""
+    try:
+        d = json.loads(out)
+    except ValueError:
+        return "", ""
+    manual = list((d.get("subtitles") or {}).keys())
+    # yt-dlp marks the untranslated auto track as "<lang>-orig"; `language` is the weaker hint.
+    orig = next((k for k in (d.get("automatic_captions") or {}) if k.endswith("-orig")), "")
+    cands = [k for k in manual if k == lang or k.startswith(lang + "-")]       # asked-for, unthrottled
+    if orig:
+        cands += [orig, orig[:-len("-orig")]]                                  # original auto-captions
+    cands.append(d.get("language") or "")
+    cands += [k for k in manual if k == "en" or k.startswith("en-")]           # English as lingua franca
+    cands += manual                                                            # anything else uploaded
+    seen, ordered = set(), []
+    for c in cands:
+        if c and c not in seen:
+            seen.add(c)
+            ordered.append(c)
+    return ",".join(ordered), (ordered[0] if ordered else "")
+
+
+def _no_captions(video_id, lang, exc):
+    throttled = isinstance(exc, RateLimited)
+    why = ("YouTube throttled the request (429). That throttle applies to auto-translated "
+           "caption tracks, and this video has no untranslated track to fall back to"
+           if throttled else str(exc))
+    return RuntimeError(f"No captions retrieved for {video_id} (lang={lang}): {why}")
+
+
 def _fetch(video_id: str, lang: str):
     with _fetch_lock:
         _rate_gate()
-        with tempfile.TemporaryDirectory() as td:
-            out = os.path.join(td, "s")
-            langs = f"{lang},{lang}.*,{lang}-orig,en,en.*"
-            cmd = [YTDLP, "--no-simulate", "--skip-download", "--write-subs", "--write-auto-subs",
-                   "--sub-langs", langs, "--sub-format", "json3", "--no-warnings",
-                   "--print", "%(title)s", "-o", out,
-                   f"https://www.youtube.com/watch?v={video_id}"]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
-            title = next((l.strip() for l in (proc.stdout or "").splitlines() if l.strip()), "")
-            files = glob.glob(os.path.join(td, "*.json3"))
-            if not files:
-                err = (proc.stderr or "").strip().splitlines()
-                raise RuntimeError(f"No captions for {video_id} (lang={lang}): {err[-1] if err else 'none available'}")
-            files.sort(key=lambda f: 0 if f".{lang}" in os.path.basename(f) else 1)
-            data = json.load(open(files[0], encoding="utf-8"))
-            lines = []
-            for ev in data.get("events", []):
-                text = "".join(seg.get("utf8", "") for seg in (ev.get("segs") or [])).strip()
-                if text:
-                    lines.append({"start": ev.get("tStartMs", 0) / 1000.0, "text": text})
-            if not lines:
-                raise RuntimeError(f"Captions for {video_id} parsed empty.")
-            return title, lines
+        try:
+            return _fetch_langs(video_id, f"{lang},{lang}.*,{lang}-orig", lang)
+        except RuntimeError as first:
+            spec, prefer = _safe_tracks(video_id, lang)
+            if not spec:
+                raise _no_captions(video_id, lang, first) from None
+            try:
+                return _fetch_langs(video_id, spec, prefer)
+            except RuntimeError as second:
+                raise _no_captions(video_id, lang, second) from None
 
 
 def _get(video_id: str, lang: str):
     cp = os.path.join(CACHE_DIR, f"{video_id}.{lang}.json")
     if os.path.exists(cp) and (time.time() - os.path.getmtime(cp)) < CACHE_TTL:
         d = json.load(open(cp, encoding="utf-8"))
-        return d.get("title", ""), d["lines"], True
-    title, lines = _fetch(video_id, lang)
-    json.dump({"title": title, "lines": lines}, open(cp, "w", encoding="utf-8"))
-    return title, lines, False
+        return d.get("title", ""), d["lines"], d.get("actual", lang), True
+    title, lines, actual = _fetch(video_id, lang)
+    json.dump({"title": title, "lines": lines, "actual": actual}, open(cp, "w", encoding="utf-8"))
+    return title, lines, actual, False
 
 
 def _format(lines, timestamps):
@@ -221,7 +295,7 @@ def get_transcript(url="", lang="en", timestamps=False, cursor=""):
         video_id, lang, timestamps, offset = _dec(cursor)
     else:
         video_id, offset = extract_video_id(url), 0
-    title, lines, cached = _get(video_id, lang)
+    title, lines, actual, cached = _get(video_id, lang)
     full = _format(lines, timestamps)
     chunk = full[offset:offset + CHUNK]
     end = offset + len(chunk)
@@ -229,8 +303,13 @@ def get_transcript(url="", lang="en", timestamps=False, cursor=""):
         sp = chunk.rfind(" ", int(CHUNK * 0.8))
         if sp > 0:
             chunk, end = chunk[:sp], offset + sp
+    # `actual` may differ from `lang`: YouTube throttles auto-translated tracks, so we serve
+    # the original-language captions instead of failing. Say so rather than mislabelling them.
+    base = actual[:-len("-orig")] if actual.endswith("-orig") else actual
+    note = (f"lang={base}" if base == lang else
+            f"lang={base} (served instead of '{lang}' — YouTube throttles auto-translated captions)")
     head = (f"# {title or video_id}\n"
-            f"video: https://youtu.be/{video_id}  ·  lang={lang}{', cached' if cached else ''}"
+            f"video: https://youtu.be/{video_id}  ·  {note}{', cached' if cached else ''}"
             f"  ·  chars {offset}-{end} of {len(full)}\n\n")
     tail = (f'\n\n[Truncated - {len(full)-end} chars remain. Continue with cursor="{_enc(video_id, lang, timestamps, end)}"]'
             if end < len(full) else "")
@@ -560,7 +639,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "YouTube URL or 11-char video ID"},
-                "lang": {"type": "string", "description": "Preferred caption language code (falls back to auto-captions, then English)", "default": "en"},
+                "lang": {"type": "string", "description": "Preferred caption language code. If YouTube will not serve it (it throttles auto-translated tracks), the video's original-language captions are returned instead and the header says so.", "default": "en"},
                 "timestamps": {"type": "boolean", "description": "Prefix each line with mm:ss", "default": False},
                 "cursor": {"type": "string", "description": "Pagination cursor from a previous truncated result"},
             },
@@ -761,7 +840,7 @@ def dispatch(method, params):
         return {
             "protocolVersion": pv if pv in PROTOCOL_VERSIONS else "2025-06-18",
             "capabilities": {"tools": {"listChanged": False}, "prompts": {"listChanged": False}},
-            "serverInfo": {"name": "youtube-transcript", "version": "2.0.1"},
+            "serverInfo": {"name": "youtube-transcript", "version": "2.1.0"},
         }
     if method == "tools/list":
         return {"tools": TOOLS}

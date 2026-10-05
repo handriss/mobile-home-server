@@ -89,6 +89,41 @@ ssh -p 8022 <phone-ip> '~/yt-transcript-mcp/venv/bin/yt-dlp --skip-download --wr
 # 5. claude.ai: Settings > Connectors > add https://<your-host>/mcp  (see report re: auth)
 ```
 
+## Troubleshooting: `HTTP Error 429: Too Many Requests`
+
+**This is not a volume limit and it is not the phone's fault.** YouTube throttles
+*auto-translated* caption tracks specifically. Asking for `lang=en` on a video whose
+captions are Korean hits the `/timedtext` translate endpoint, which is refused with a 429
+most of the time — reproducible from a clean IP that has fetched nothing all day, though it
+does intermittently succeed (yt-dlp [#13831](https://github.com/yt-dlp/yt-dlp/issues/13831),
+[#13770](https://github.com/yt-dlp/yt-dlp/issues/13770)). That intermittency is why this
+looked like a mysterious flaky rate limit rather than a property of the track being asked for.
+
+Manual subtitles and the video's **original-language** auto-captions are *not* throttled:
+
+```bash
+yt-dlp --skip-download --write-auto-subs --sub-langs en -o s "https://youtu.be/9bZkp7q19f0"
+#   -> ERROR: Unable to download video subtitles for 'en': HTTP Error 429
+yt-dlp --skip-download --write-auto-subs --sub-langs ko -o s "https://youtu.be/9bZkp7q19f0"
+#   -> s.ko.json3   (same video, original language, fine)
+```
+
+Since 2.1.0 `get_transcript` handles this: it requests the language you asked for (normally
+the original, so nothing extra is fetched), and if that is refused it looks up which tracks
+are actually unthrottled — creator-uploaded subtitles and the original-language
+auto-captions — and returns the best of those, labelling the result
+`lang=ko (served instead of 'en' …)`. Claude can translate from the original itself, so a
+readable transcript beats a hard error. It deliberately does **not** retry the throttled
+request — upstream reports every retry restarts the throttle timer.
+
+If you still see 429s, or start seeing 403s, update yt-dlp first — a stale extractor is the
+usual cause of every other YouTube HTTP error:
+
+```bash
+ssh -p 8022 <phone-ip> 'pip install -U yt-dlp && yt-dlp --version'
+ssh -p 8022 <phone-ip> 'tail -40 ~/yt-transcript-mcp/mcp.log'   # server-side errors
+```
+
 ## Auth: the server is its own OAuth authority
 
 We tried Cloudflare Access first. It **doesn't work**: a self-hosted Access app
